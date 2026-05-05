@@ -140,13 +140,22 @@ async def _enqueue_url(
         )
         return
 
-    if parsed.kind == "url" and parsed.provider == "spotify":
+    if parsed.kind == "url" and parsed.provider in {"spotify", "soundcloud"}:
         resolved = await resolve_short_url(parsed.entity_id)
         reparsed = parse_all(resolved, registry)
         if reparsed and reparsed[0].kind != "url":
             parsed = reparsed[0]
+        elif parsed.provider == "soundcloud":
+            parsed = parsed.__class__(
+                provider=parsed.provider,
+                kind=parsed.kind,
+                entity_id=resolved,
+                url=resolved,
+            )
         else:
-            raise UnsupportedURLError(f"could not resolve Spotify shortlink: {parsed.entity_id}")
+            raise UnsupportedURLError(
+                f"could not resolve {parsed.provider} shortlink: {parsed.entity_id}"
+            )
 
     if parsed.kind == "url" and parsed.provider == "soundcloud":
         from providers.soundcloud.provider import SoundCloudProvider, _track_from_json  # noqa: SLF001

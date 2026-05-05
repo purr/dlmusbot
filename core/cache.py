@@ -24,6 +24,11 @@ class CachedAudio(BaseModel):
     performer: str = ""
     duration: int = 0
     mime_type: str = ""
+    reencoded: bool = False
+    # Target bitrate the file was shrunk to during the fit-to-cap path.
+    # Persisted so cache hits surface the same "Re-encoded to N kbps MP3"
+    # warning every time, not just on the first delivery.
+    reencoded_kbps: int = 0
     cached_at: int = Field(default_factory=lambda: int(time.time()))
 
 

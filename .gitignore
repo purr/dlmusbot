@@ -24,3 +24,8 @@ data/
 # OS
 Thumbs.db
 .DS_Store
+
+# AI
+.cursor/
+AGENTS.md
+CLAUDE.md

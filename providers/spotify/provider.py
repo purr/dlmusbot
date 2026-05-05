@@ -611,7 +611,32 @@ class SpotifyProvider(Provider):
         format_name = result.selected_format
         size_bytes = result.output_size_bytes
 
+        # Spotify gives us OGG_VORBIS, but Telegram's bot API frequently
+        # mis-classifies bot-uploaded OGG as voice messages — voice file_ids
+        # can't be swapped via edit_message_media (MEDIA_NEW_INVALID), which
+        # breaks the inline article→audio upgrade. MP3 is unambiguous: it
+        # always rides as audio. We transcode every Spotify download to MP3
+        # at the source bitrate (lossy→lossy at 320 is inaudible for typical
+        # material; 160/96 sources match their source rate to avoid wasting
+        # space).
+        from core.audio_convert import transcode_to_mp3, ffmpeg_available
         ext = file_path.rsplit(".", 1)[-1].lower()
+        if ext == "ogg" and ffmpeg_available():
+            target_kbps = 320
+            if format_name.startswith("OGG_VORBIS_"):
+                try:
+                    target_kbps = int(format_name.rsplit("_", 1)[-1])
+                except ValueError:
+                    pass
+            mp3_path = await transcode_to_mp3(
+                file_path, bitrate_kbps=target_kbps,
+            )
+            if mp3_path is not None and mp3_path.is_file():
+                file_path = str(mp3_path)
+                size_bytes = mp3_path.stat().st_size
+                format_name = f"MP3_{target_kbps}_FROM_{format_name}"
+                ext = "mp3"
+
         mime = {
             "ogg": "audio/ogg",
             "mp3": "audio/mpeg",
@@ -635,6 +660,17 @@ class SpotifyProvider(Provider):
         # For downstream tags/scrobbling we want Spotify's primary artist only.
         sp_artists = sp_artists_all[:1] if sp_artists_all else []
 
+        # Featured-artist names get stripped from track.artists (so the
+        # display caption / artist button stays clean), but we still want
+        # them in the file's ID3 tags so players can show "feat. X". Pipe
+        # them through extra so the tagger can pick them up.
+        featured_names = [a.name for a in st.featured_artists if a.name]
+        new_extra = dict(track.extra or {})
+        if featured_names:
+            new_extra["featured_artists"] = featured_names
+        if len(sp_artists_all) > 1:
+            new_extra["all_artists"] = [a.name for a in sp_artists_all]
+
         merged = track.model_copy(update={
             "title": st.name or track.title,
             "artists": sp_artists,
@@ -642,6 +678,7 @@ class SpotifyProvider(Provider):
             "duration_seconds": (st.duration_ms // 1000) or track.duration_seconds,
             "artwork_url": (st.album.cover_url if st.album else None) or track.artwork_url,
             "isrc": st.isrc or track.isrc,
+            "extra": new_extra,
         })
 
         _log.info(

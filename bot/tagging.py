@@ -16,7 +16,7 @@ from typing import Optional
 import aiohttp
 from loguru import logger
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, WXXX, WOAS
+from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, TPE2, TXXX, WXXX, WOAS
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
@@ -125,17 +125,36 @@ def _tag_sync(
     original_spotify_url: Optional[str],
 ) -> None:
     urls = _collect_urls(track, original_spotify_url=original_spotify_url)
+    extras = _collect_extras(track)
     ext = Path(path).suffix.lower().lstrip(".")
     if ext == "mp3":
-        _tag_id3(path, track.title, track.artists_str, track.album, cover, urls)
+        _tag_id3(path, track.title, track.artists_str, track.album, cover, urls, extras)
     elif ext == "flac":
-        _tag_flac(path, track.title, track.artists_str, track.album, cover, urls)
+        _tag_flac(path, track.title, track.artists_str, track.album, cover, urls, extras)
     elif ext in ("m4a", "mp4"):
-        _tag_mp4(path, track.title, track.artists_str, track.album, cover, urls)
+        _tag_mp4(path, track.title, track.artists_str, track.album, cover, urls, extras)
     elif ext == "ogg":
-        _tag_ogg(path, track.title, track.artists_str, track.album, cover, OggVorbis, urls)
+        _tag_ogg(path, track.title, track.artists_str, track.album, cover, OggVorbis, urls, extras)
     elif ext == "opus":
-        _tag_ogg(path, track.title, track.artists_str, track.album, cover, OggOpus, urls)
+        _tag_ogg(path, track.title, track.artists_str, track.album, cover, OggOpus, urls, extras)
+
+
+def _collect_extras(track: Track) -> dict:
+    """Pull provider-supplied extra metadata (featured artists, full artist
+    list, etc.) out of `track.extra` for tagging. Spotify strips featured
+    artists from `track.artists` so the inline UI / artist button stays
+    clean — but they should still land in the file's tags."""
+    out: dict = {}
+    feat = track.extra.get("featured_artists") if track.extra else None
+    if isinstance(feat, list):
+        out["featured_artists"] = [str(x) for x in feat if x]
+    all_artists = track.extra.get("all_artists") if track.extra else None
+    if isinstance(all_artists, list):
+        out["all_artists"] = [str(x) for x in all_artists if x]
+    isrc = getattr(track, "isrc", None)
+    if isrc:
+        out["isrc"] = str(isrc)
+    return out
 
 
 def _collect_urls(track: Track, *, original_spotify_url: Optional[str]) -> dict:
@@ -165,7 +184,7 @@ def _collect_urls(track: Track, *, original_spotify_url: Optional[str]) -> dict:
     }
 
 
-def _tag_id3(path, title, artist, album, cover, urls: dict):
+def _tag_id3(path, title, artist, album, cover, urls: dict, extras: dict):
     try:
         tags = ID3(path)
     except ID3NoHeaderError:
@@ -188,16 +207,29 @@ def _tag_id3(path, title, artist, album, cover, urls: dict):
     _set_wxxx(tags, "PERMALINK_URL", urls.get("permalink_url"))
     for i, url in enumerate(urls.get("artist_urls") or [], start=1):
         _set_wxxx(tags, f"ARTIST_URL_{i}", url)
+    # TPE2 is conventionally the album artist; default to the lead
+    # performer (TPE1) so libraries group correctly.
+    tags["TPE2"] = TPE2(encoding=3, text=artist)
+    feat = extras.get("featured_artists") or []
+    if feat:
+        _set_txxx(tags, "FEATURED_ARTISTS", ", ".join(feat))
+    all_artists = extras.get("all_artists") or []
+    if all_artists:
+        _set_txxx(tags, "ALL_ARTISTS", ", ".join(all_artists))
+    isrc = extras.get("isrc")
+    if isrc:
+        _set_txxx(tags, "ISRC", isrc)
     tags.save(path, v2_version=3)
 
 
-def _tag_flac(path, title, artist, album, cover, urls: dict):
+def _tag_flac(path, title, artist, album, cover, urls: dict, extras: dict):
     f = FLAC(path)
     f["title"] = title
     f["artist"] = artist
     if album:
         f["album"] = album
     _set_vorbis_urls(f, urls)
+    _set_vorbis_extras(f, extras)
     f.clear_pictures()
     if cover:
         pic = Picture()
@@ -208,36 +240,47 @@ def _tag_flac(path, title, artist, album, cover, urls: dict):
     f.save()
 
 
-def _tag_mp4(path, title, artist, album, cover, urls: dict):
+def _tag_mp4(path, title, artist, album, cover, urls: dict, extras: dict):
     f = MP4(path)
     f["\xa9nam"] = title
     f["\xa9ART"] = artist
     if album:
         f["\xa9alb"] = album
     _set_mp4_urls(f, urls)
+    f["aART"] = artist  # album artist
+    feat = extras.get("featured_artists") or []
+    if feat:
+        f["----:com.apple.iTunes:FEATURED_ARTISTS"] = [", ".join(feat).encode("utf-8")]
+    if extras.get("all_artists"):
+        f["----:com.apple.iTunes:ALL_ARTISTS"] = [
+            ", ".join(extras["all_artists"]).encode("utf-8")
+        ]
+    if extras.get("isrc"):
+        f["----:com.apple.iTunes:ISRC"] = [extras["isrc"].encode("utf-8")]
     if cover:
         f["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
     f.save()
 
 
-def _tag_ogg(path, title, artist, album, cover, klass, urls: dict):
+def _tag_ogg(path, title, artist, album, cover, klass, urls: dict, extras: dict):
     try:
-        _apply_ogg_tags(path, title, artist, album, cover, klass, urls)
+        _apply_ogg_tags(path, title, artist, album, cover, klass, urls, extras)
         return
     except Exception:
         if not ffmpeg_available():
             raise
         _repair_ogg_container(path)
-        _apply_ogg_tags(path, title, artist, album, cover, klass, urls)
+        _apply_ogg_tags(path, title, artist, album, cover, klass, urls, extras)
 
 
-def _apply_ogg_tags(path, title, artist, album, cover, klass, urls: dict):
+def _apply_ogg_tags(path, title, artist, album, cover, klass, urls: dict, extras: dict):
     f = klass(path)
     f["title"] = title
     f["artist"] = artist
     if album:
         f["album"] = album
     _set_vorbis_urls(f, urls)
+    _set_vorbis_extras(f, extras)
     if cover:
         import base64
         pic = Picture()
@@ -284,6 +327,28 @@ def _set_wxxx(tags: ID3, desc: str, url: Optional[str]) -> None:
     key = f"WXXX:{desc}"
     tags.delall(key)
     tags.add(WXXX(encoding=3, desc=desc, url=url))
+
+
+def _set_txxx(tags: ID3, desc: str, value: Optional[str]) -> None:
+    if not value:
+        return
+    key = f"TXXX:{desc}"
+    tags.delall(key)
+    tags.add(TXXX(encoding=3, desc=desc, text=value))
+
+
+def _set_vorbis_extras(f, extras: dict) -> None:
+    feat = extras.get("featured_artists") or []
+    if feat:
+        f["featured_artists"] = feat
+    if extras.get("all_artists"):
+        f["all_artists"] = extras["all_artists"]
+    if extras.get("isrc"):
+        f["isrc"] = extras["isrc"]
+    # Default album-artist to the existing artist tag so libraries group.
+    artist_val = f.get("artist")
+    if artist_val and not f.get("albumartist"):
+        f["albumartist"] = artist_val
 
 
 def _set_vorbis_urls(f, urls: dict) -> None:

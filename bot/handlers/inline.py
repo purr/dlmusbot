@@ -174,11 +174,18 @@ async def _build_results(
         # search query — surface "Unsupported URL" so they know which
         # platforms are actually wired up.
         return [], "unsupported_url", 0
-    if parsed and parsed.kind == "url" and parsed.provider == "spotify":
+    if parsed and parsed.kind == "url" and parsed.provider in {"spotify", "soundcloud"}:
         resolved = await resolve_short_url(parsed.entity_id)
         reparsed = parse_url(resolved, registry)
         if reparsed and reparsed.kind != "url":
             parsed = reparsed
+        elif parsed.provider == "soundcloud":
+            parsed = parsed.__class__(
+                provider=parsed.provider,
+                kind=parsed.kind,
+                entity_id=resolved,
+                url=resolved,
+            )
         else:
             return [], "unsupported_url", 0
     if parsed:
@@ -227,7 +234,7 @@ async def _build_results(
                         try:
                             kind, data = await provider.resolve_kind(parsed.entity_id)
                         except TrackNotFoundError:
-                            return [], "artist_not_found", 0
+                            return [], "unsupported_url", 0
                         if kind == "track":
                             t = _track_from_json(data)
                             return ([t] if t else []), "single", (1 if t else 0)

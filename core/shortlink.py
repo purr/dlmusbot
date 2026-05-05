@@ -5,7 +5,12 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-_SHORTLINK_DOMAINS = frozenset({"spoti.fi", "spotify.link"})
+_SHORTLINK_DOMAINS = frozenset({
+    "spoti.fi",
+    "spotify.link",
+    "on.soundcloud.com",
+    "snd.sc",
+})
 
 
 async def resolve(url: str) -> str:

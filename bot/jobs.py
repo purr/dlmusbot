@@ -35,6 +35,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardMarkup,
     InputMediaAudio,
+    Message,
 )
 from loguru import logger
 
@@ -60,12 +61,36 @@ from .status import (
     audio_kb,
     failed_kb,
     final_failed_kb,
+    inline_audio_kb,
     inline_stage_kb,
     permission_required_kb,
     stage_kb,
 )
 from .tagging import embed_metadata, fetch_cover, prepare_telegram_thumbnail
 from .ui import format_track_caption
+
+
+import re as _re_mod
+
+_KBPS_IN_FORMAT = _re_mod.compile(r"(\d{2,4})")
+
+
+def _guess_source_kbps(format_name: str) -> Optional[int]:
+    """Pull a kbps number out of a provider format string. Examples:
+    `OGG_VORBIS_320` → 320, `MP3_128_CBR` → 128, `opus_progressive` → None.
+    Used to preserve source quality when transcoding OGG/Opus → MP3."""
+    if not format_name:
+        return None
+    m = _KBPS_IN_FORMAT.search(format_name)
+    if not m:
+        return None
+    try:
+        v = int(m.group(1))
+    except ValueError:
+        return None
+    if 32 <= v <= 320:
+        return v
+    return None
 
 
 # Hard cap on retries per inline message. After this many consecutive
@@ -270,6 +295,8 @@ class JobRunner:
                 pass
 
         await set_stage("downloading")
+        used_fit_reencode = False
+        reencoded_kbps = 0
         with tempfile.TemporaryDirectory(prefix="dlmus_") as tmp:
             result = await self._download_with_retries(
                 provider, track, tmp, on_stage=set_stage,
@@ -345,7 +372,43 @@ class JobRunner:
                     "format_name": f"MP3_{target_kbps}_CBR",
                     "mime_type": "audio/mpeg",
                 })
+                used_fit_reencode = True
+                reencoded_kbps = target_kbps
                 size_mb = new_mb
+
+            # Final-line defence against OGG/Opus reaching Telegram. Any
+            # provider that produces .ogg/.opus (SoundCloud opus, YT Music
+            # webm/opus fallback) gets transcoded to MP3 here. OGG family
+            # files are routinely classified as voice messages by Telegram
+            # — voice file_ids can't be swapped via edit_message_media,
+            # which breaks inline delivery. MP3 is unambiguous: always
+            # rides as audio. Spotify already converts in its provider so
+            # this is a no-op for Spotify; for the others it ensures the
+            # invariant "we never upload OGG" holds across the whole bot.
+            ext_now = Path(result.file_path).suffix.lower()
+            if ext_now in (".ogg", ".opus"):
+                source_kbps = _guess_source_kbps(result.format_name) or 320
+                logger.info(
+                    "[{}] {} detected; transcoding to MP3 {} kbps for telegram compatibility",
+                    tag, ext_now.lstrip("."), source_kbps,
+                )
+                mp3_path = await transcode_to_mp3(
+                    result.file_path, bitrate_kbps=source_kbps,
+                )
+                if mp3_path is None:
+                    logger.warning(
+                        "[{}] ffmpeg unavailable; cannot convert {} to MP3 — proceeding with original",
+                        tag, ext_now,
+                    )
+                else:
+                    new_size = mp3_path.stat().st_size
+                    result = result.model_copy(update={
+                        "file_path": str(mp3_path),
+                        "size_bytes": new_size,
+                        "format_name": f"MP3_{source_kbps}_FROM_{result.format_name}",
+                        "mime_type": "audio/mpeg",
+                    })
+                    size_mb = new_size / 1024 / 1024
 
             logger.debug(
                 "[{}] embedding metadata + cover into {}",
@@ -368,12 +431,37 @@ class JobRunner:
             sent = await self._deliver_audio(
                 target, result, cover_bytes,
                 original_spotify_url=target.original_spotify_url,
+                reencoded=used_fit_reencode,
+                reencoded_kbps=reencoded_kbps,
             )
-            if sent and sent.audio is not None:
+            sent_kind, sent_file_id, sent_unique_id, sent_mime_type = self._extract_media_ids(sent)
+            logger.info(
+                "[{}] telegram accepted upload as kind={} mime={} ext={} fmt={}",
+                tag,
+                sent_kind or "unknown",
+                sent_mime_type or result.mime_type or "unknown",
+                Path(result.file_path).suffix.lower() or "n/a",
+                result.format_name,
+            )
+
+            # No OGG-as-voice rescue needed: the upstream "no OGG to
+            # Telegram" guard transcodes any .ogg/.opus to MP3 before
+            # the upload happens. If sent_kind ever comes back as voice
+            # here, that's a new failure mode worth logging loudly
+            # rather than silently rescuing.
+            if sent_kind == "voice":
+                logger.error(
+                    "[{}] unexpected: telegram returned voice for non-ogg upload (ext={}, fmt={}); inline edit will fail",
+                    tag,
+                    Path(result.file_path).suffix.lower(),
+                    result.format_name,
+                )
+
+            if sent_file_id:
                 logger.info(
                     "[{}] delivered to chat={} file_id={}",
                     tag, target.chat_id or target.user_id,
-                    sent.audio.file_id,
+                    sent_file_id,
                 )
                 # Successful delivery — wipe any prior retry tally
                 # for this inline message so a future re-trigger
@@ -381,28 +469,89 @@ class JobRunner:
                 if target.inline_message_id is not None:
                     self._inline_failures.pop(target.inline_message_id, None)
             file_id_for_inline: Optional[str] = None
-            if sent is not None and sent.audio is not None:
-                file_id_for_inline = sent.audio.file_id
+            # Only cache + use for inline when it's an audio file_id. Voice
+            # file_ids can't drive the article→audio swap and would just
+            # poison the cache for every subsequent click.
+            if sent_file_id and sent_kind != "voice":
+                file_id_for_inline = sent_file_id
                 await self._cache.put(
                     provider=track.provider,
                     track_id=track.track_id,
                     entry=CachedAudio(
-                        file_id=sent.audio.file_id,
-                        file_unique_id=sent.audio.file_unique_id,
+                        file_id=sent_file_id,
+                        file_unique_id=sent_unique_id or sent_file_id,
                         title=result.track.title,
                         performer=result.track.artists_str,
                         duration=result.track.duration_seconds,
-                        mime_type=result.mime_type,
+                        mime_type=sent_mime_type or result.mime_type,
+                        reencoded=used_fit_reencode,
+                        reencoded_kbps=reencoded_kbps,
                     ),
                 )
 
         # Swap the inline article into the audio in-place (purr pattern).
-        # No reply_markup -> all buttons disappear after success.
+        # No reply_markup unless the file was re-encoded (then we keep the
+        # source/artist row + the warning indicator, mirroring DM mode).
         if file_id_for_inline:
-            await self._update_inline_with_audio(
+            inline_updated = await self._update_inline_with_audio(
                 target, result.track, file_id_for_inline,
                 original_spotify_url=target.original_spotify_url,
+                reencoded_kbps=reencoded_kbps,
             )
+
+            if not inline_updated:
+                await self._set_inline_kb(target, failed_kb(track.provider, track.track_id))
+        elif target.inline_message_id:
+            logger.warning(
+                "[{}] delivered but no reusable media id returned; clearing inline loading kb",
+                tag,
+            )
+            await self._set_inline_kb(target, failed_kb(track.provider, track.track_id))
+
+    def _extract_media_ids(
+        self, sent: Optional[Message]
+    ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """Get reusable Telegram file identifiers from successful sends.
+
+        Some OGG uploads arrive back as `voice`/`document` instead of `audio`.
+        We still need a file_id to finalize inline placeholders.
+        """
+        if sent is None:
+            return None, None, None, None
+        if sent.audio is not None:
+            return "audio", sent.audio.file_id, sent.audio.file_unique_id, sent.audio.mime_type
+        if sent.document is not None:
+            return (
+                "document",
+                sent.document.file_id,
+                sent.document.file_unique_id,
+                sent.document.mime_type,
+            )
+        if sent.voice is not None:
+            return "voice", sent.voice.file_id, sent.voice.file_unique_id, "audio/ogg"
+        return None, None, None, None
+
+    async def _try_inline_mp3_rescue(
+        self, result: "DownloadResult | _SyntheticResult"
+    ) -> Optional["DownloadResult | _SyntheticResult"]:
+        if isinstance(result, _SyntheticResult):
+            return None
+        if not result.file_path:
+            return None
+        src = Path(result.file_path)
+        if not src.is_file():
+            return None
+        bitrate_kbps = 320
+        mp3_path = await transcode_to_mp3(result.file_path, bitrate_kbps=bitrate_kbps)
+        if mp3_path is None or not mp3_path.is_file():
+            return None
+        new_size = mp3_path.stat().st_size
+        return result.model_copy(update={
+            "file_path": str(mp3_path),
+            "size_bytes": new_size,
+            "format_name": f"MP3_{bitrate_kbps}_INLINE_RESCUE",
+            "mime_type": "audio/mpeg",
+        })
 
     async def _download_with_retries(
         self, provider: Provider, track: Track, dest_dir: str, *,
@@ -457,12 +606,28 @@ class JobRunner:
         await self._deliver_audio(
             target, synthetic, cover_bytes=None,
             original_spotify_url=target.original_spotify_url,
+            reencoded=cached.reencoded,
+            reencoded_kbps=cached.reencoded_kbps,
         )
-        # Inline article → audio in-place via cached file_id (no buttons).
-        await self._update_inline_with_audio(
-            target, track, cached.file_id,
-            original_spotify_url=target.original_spotify_url,
-        )
+        # Inline article → audio in-place via cached file_id. Carry the
+        # re-encoded marker forward so cache hits look identical to the
+        # very first delivery (warning button + source/artist row).
+        if target.inline_message_id is not None:
+            inline_ok = await self._update_inline_with_audio(
+                target, track, cached.file_id,
+                original_spotify_url=target.original_spotify_url,
+                reencoded_kbps=cached.reencoded_kbps,
+            )
+            if not inline_ok:
+                # Stale voice-typed file_id from before the kind=voice
+                # detection was in place. Drop it so the next click
+                # re-downloads + re-uploads fresh as MP3.
+                logger.warning(
+                    "[{}:{}] cached file_id rejected by inline edit; "
+                    "evicting stale entry",
+                    track.provider, track.track_id,
+                )
+                await self._cache.remove(track.provider, track.track_id)
 
     # ---- delivery -----------------------------------------------------
 
@@ -472,6 +637,8 @@ class JobRunner:
         result: "DownloadResult | _SyntheticResult",
         cover_bytes: Optional[bytes],
         original_spotify_url: Optional[str] = None,
+        reencoded: bool = False,
+        reencoded_kbps: int = 0,
     ):
         chat_id = target.chat_id or target.user_id
         if chat_id is None:
@@ -503,7 +670,11 @@ class JobRunner:
                 duration=result.track.duration_seconds or None,
                 thumbnail=thumb_ref,
                 reply_to_message_id=target.reply_to_message_id,
-                reply_markup=audio_kb(result.track),
+                reply_markup=audio_kb(
+                    result.track,
+                    reencoded=reencoded or bool(reencoded_kbps),
+                    reencoded_kbps=reencoded_kbps or None,
+                ),
             )
         except TelegramForbiddenError as e:
             raise DMNotOpenError(
@@ -614,7 +785,7 @@ class JobRunner:
     # ---- status helpers ----------------------------------------------
 
     async def _set_inline_kb(
-        self, target: DeliveryTarget, kb: InlineKeyboardMarkup
+        self, target: DeliveryTarget, kb: Optional[InlineKeyboardMarkup]
     ) -> None:
         if not target.inline_message_id:
             return
@@ -630,13 +801,16 @@ class JobRunner:
         track: Track,
         file_id: str,
         original_spotify_url: Optional[str] = None,
-    ) -> None:
+        reencoded_kbps: int = 0,
+    ) -> bool:
         """Convert the inline article into an audio message in-place via
-        edit_message_media with a cached file_id. No reply_markup is passed,
-        so the inline message ends up with NO buttons after success — exactly
-        purr's `update_inline_message_with_audio` behaviour."""
+        edit_message_media with a cached file_id. Attaches the source +
+        artist links and (when applicable) a permanent "re-encoded to N
+        kbps MP3" indicator so users see the same context they'd see in
+        a DM-mode delivery. Pass `reencoded_kbps=0` for normal-fit
+        deliveries to keep the inline message clean."""
         if not target.inline_message_id:
-            return
+            return False
 
         thumb: Optional[BufferedInputFile] = None
         if self._http is not None and track.artwork_url:
@@ -655,20 +829,24 @@ class JobRunner:
             duration=track.duration_seconds or None,
             thumbnail=thumb,
         )
+        kb = inline_audio_kb(track, reencoded_kbps=reencoded_kbps or None)
         try:
             await self._bot.edit_message_media(
                 inline_message_id=target.inline_message_id,
                 media=media,
+                reply_markup=kb,
             )
+            return True
         except (TelegramBadRequest, TelegramNetworkError) as e:
             logger.warning(
-                "inline edit_message_media failed: {} — falling back to button edit", e,
+                "inline edit_message_media failed for [{}:{}] file_id={} ({}): {}",
+                track.provider,
+                track.track_id,
+                file_id[:24] + "...",
+                type(e).__name__,
+                e,
             )
-            with contextlib.suppress(TelegramBadRequest):
-                await self._bot.edit_message_reply_markup(
-                    inline_message_id=target.inline_message_id,
-                    reply_markup=None,
-                )
+            return False
 
     async def _mark_failed(self, target: DeliveryTarget, track: Track) -> None:
         # For inline targets, track consecutive failures per inline message.

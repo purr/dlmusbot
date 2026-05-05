@@ -57,12 +57,20 @@ def target_bitrate_for_size(
     listenable rate (`MIN_LISTENABLE_KBPS`) wouldn't fit."""
     if duration_seconds <= 0:
         return 0
+
     raw_kbps = int((target_mb * safety_margin * 8 * 1024) / duration_seconds)
     # Round down to a "clean" bitrate (multiples of 16 kbps).
     raw_kbps -= raw_kbps % 16
+
+    # If 128 kbps actually fits the target without safety margin, allow it
+    # even when safety-margined math rounds below 128 — clamp up rather
+    # than reject. Long tracks (~45-50 min) hit this exactly: real fit at
+    # 128 is fine, but safety_margin pushes the calc to ~112.
+    if estimate_size_mb(duration_seconds, MIN_LISTENABLE_KBPS) <= target_mb:
+        return min(max(raw_kbps, MIN_LISTENABLE_KBPS), 320)
+
     if raw_kbps < MIN_LISTENABLE_KBPS:
         return 0
-    # Don't bother encoding *higher* than the source.
     return min(raw_kbps, 320)
 
 
