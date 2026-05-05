@@ -1,0 +1,26 @@
+# Local secrets — bot token, sp_dc, sc client_id
+config.py
+cookies*.txt
+*.cookies.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+spotify_test/
+
+# Bot
+tests/
+data/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

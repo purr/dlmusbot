@@ -1,0 +1,17 @@
+# Install into your active venv:
+#   pip install -r requirements.txt
+
+aiogram
+aiohttp
+pydantic
+rapidfuzz
+yt-dlp
+mutagen
+loguru
+Pillow
+cryptography
+
+# Spotify downloader transitive (already vendored from spotify_test/libs):
+#   pefile, unicorn, rich, markdown_it, mdurl, pygments, idna, multidict,
+#   yarl, frozenlist, aiosignal, aiohappyeyeballs, propcache, attrs,
+#   annotated_types, pydantic_core, typing_extensions, typing_inspection

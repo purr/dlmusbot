@@ -1,0 +1,224 @@
+"""DM link handler.
+
+Posts the FULL placeholder (purr-style):
+    text   = format_track_caption(track, bot_username)
+    buttons= [Source · Artist] [⏳ Downloading...]
+
+Then the job runner sends the audio with the same caption + final buttons
+[Source · Artist] [❓ Wrong Artist/Title?] and deletes the placeholder.
+"""
+
+from __future__ import annotations
+
+import contextlib
+
+from aiogram import F, Router
+from aiogram.enums import ChatType
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from loguru import logger
+
+from core.exceptions import DlmusError, TrackNotFoundError, UnsupportedURLError
+from core.models import Track
+from core.shortlink import resolve as resolve_short_url
+from core.url_parser import ParsedURL, parse_all
+from providers.registry import Registry
+
+from ..dm_probe import DMProbe
+from ..jobs import DeliveryTarget, JobRunner
+from ..status import failed_kb, placeholder_kb
+from ..ui import PREPARING_TEXT
+
+
+# Pretty labels for the album/playlist DM-rejection notice.
+_KIND_LABEL = {
+    "album": ("💿", "albums"),
+    "playlist": ("📚", "playlists"),
+}
+
+
+async def _reject_collection(
+    message: Message, parsed: ParsedURL, kind_label: str = "album",
+) -> None:
+    """DMs only deliver single tracks — albums / playlists would hammer the
+    download queue with dozens of jobs at once. Politely refuse with a
+    button that fills the user's chatbox with the same URL via inline
+    mode (`switch_inline_query_current_chat`), so they pick individual
+    tracks from the inline result list."""
+    emoji, plural = _KIND_LABEL.get(kind_label, ("📁", "collections"))
+    await message.reply(
+        f"{emoji} <b>{plural.capitalize()} aren't supported in DM.</b>\n"
+        f"Tap below to open the {kind_label} inline and pick the tracks "
+        f"you want.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"🔍 Open {kind_label} inline",
+                switch_inline_query_current_chat=parsed.url,
+            ),
+        ]]),
+        disable_notification=True,
+        disable_web_page_preview=True,
+    )
+
+router = Router(name="dm")
+
+
+async def _post_placeholder(
+    message: Message, track: Track, job_runner: JobRunner,
+    *, original_spotify_url: str | None = None,
+) -> int:
+    """Send the placeholder reply: full caption + Source/Artist/Downloading
+    buttons. Returns the message_id we'll later delete."""
+    sent = await message.reply(
+        job_runner.caption(track, original_spotify_url=original_spotify_url),
+        reply_markup=placeholder_kb(track),
+        disable_notification=True,
+        disable_web_page_preview=True,
+    )
+    return sent.message_id
+
+
+async def _enqueue_track(
+    provider, track: Track, message: Message,
+    job_runner: JobRunner, queue,
+    *, original_spotify_url: str | None = None,
+    request_query: str | None = None,
+) -> None:
+    status_id = await _post_placeholder(
+        message, track, job_runner,
+        original_spotify_url=original_spotify_url,
+    )
+    target = DeliveryTarget(
+        chat_id=message.chat.id,
+        user_id=message.from_user.id,
+        reply_to_message_id=message.message_id,
+        status_message_id=status_id,
+        original_spotify_url=original_spotify_url,
+        request_query=request_query,
+        request_source="dm_link",
+    )
+    queue.submit(lambda: job_runner.run(provider, track, target))
+
+
+async def _enqueue_url(
+    parsed: ParsedURL,
+    message: Message,
+    registry: Registry,
+    job_runner: JobRunner,
+    queue,
+) -> None:
+    logger.info(
+        "url received: provider={} kind={} id={} from user={}",
+        parsed.provider, parsed.kind, parsed.entity_id,
+        message.from_user.id if message.from_user else "?",
+    )
+    provider = registry.get(parsed.provider)
+    if provider is None:
+        raise UnsupportedURLError(f"no provider for {parsed.provider}")
+
+    # Albums / playlists are inline-only. DM downloads only allowed for
+    # single tracks — pasting a 35-track album would otherwise queue a
+    # mass download the user almost never wants. Bounce them to inline
+    # via `switch_inline_query_current_chat`.
+    if parsed.kind in ("album", "playlist"):
+        await _reject_collection(message, parsed, kind_label=parsed.kind)
+        return
+
+    if parsed.kind == "track":
+        track = await provider.get_track(parsed.entity_id)
+        logger.info(
+            "track resolved: [{}:{}] {} ({})",
+            parsed.provider, parsed.entity_id,
+            track.display_title, track.duration_str,
+        )
+        await _enqueue_track(
+            provider, track, message, job_runner, queue,
+            request_query=parsed.url,
+        )
+        return
+
+    if parsed.kind == "url" and parsed.provider == "spotify":
+        resolved = await resolve_short_url(parsed.entity_id)
+        reparsed = parse_all(resolved, registry)
+        if reparsed and reparsed[0].kind != "url":
+            parsed = reparsed[0]
+        else:
+            raise UnsupportedURLError(f"could not resolve Spotify shortlink: {parsed.entity_id}")
+
+    if parsed.kind == "url" and parsed.provider == "soundcloud":
+        from providers.soundcloud.provider import SoundCloudProvider, _track_from_json  # noqa: SLF001
+        if not isinstance(provider, SoundCloudProvider):
+            raise UnsupportedURLError("expected SoundCloudProvider")
+        kind, data = await provider.resolve_kind(parsed.entity_id)
+        if kind == "track":
+            t = _track_from_json(data)
+            if t is None:
+                raise TrackNotFoundError("could not parse SoundCloud track")
+            await _enqueue_track(
+                provider, t, message, job_runner, queue,
+                request_query=parsed.url,
+            )
+            return
+        if kind == "playlist":
+            # SoundCloud lumps both albums and playlists under
+            # kind="playlist"; only the `is_album` flag distinguishes
+            # them. Either way DM rejects — bounce to inline.
+            label = "album" if data.get("is_album") else "playlist"
+            await _reject_collection(message, parsed, kind_label=label)
+            return
+        raise UnsupportedURLError(f"unknown SoundCloud entity kind: {kind}")
+
+    raise UnsupportedURLError(f"don't know how to handle {parsed.kind}")
+
+
+@router.message(F.chat.type == ChatType.PRIVATE, F.text)
+async def on_dm_text(
+    message: Message,
+    registry: Registry,
+    job_runner: JobRunner,
+    queue,
+    dm_probe: DMProbe,
+    bot_username: str,
+) -> None:
+    dm_probe.mark_open(message.from_user.id)
+
+    text = message.text or ""
+    urls = parse_all(text, registry)
+    if not urls:
+        return
+    logger.info(
+        "<cyan>[dm]</cyan> user={} urls={} text={!r}",
+        message.from_user.id,
+        len(urls),
+        text.strip()[:220],
+    )
+
+    # Instant ack only when we'll actually queue more than one track —
+    # single-track URLs get the rich placeholder, album/playlist URLs get
+    # the inline-bounce notice (sending PREPARING_TEXT in those cases
+    # would just be a duplicate confirmation message).
+    track_urls = sum(1 for u in urls if u.kind == "track")
+    if track_urls > 1:
+        with contextlib.suppress(Exception):
+            await message.reply(PREPARING_TEXT, disable_notification=True)
+
+    for parsed in urls:
+        try:
+            await _enqueue_url(parsed, message, registry, job_runner, queue)
+        except DlmusError as e:
+            logger.warning("dm enqueue failed [{}]: {}", parsed.url, e)
+            with contextlib.suppress(Exception):
+                await message.reply(
+                    "❌ <b>Couldn't grab that link</b>",
+                    reply_markup=failed_kb(parsed.provider, parsed.entity_id),
+                )
+        except Exception:
+            logger.exception("dm enqueue failed [{}]", parsed.url)
+            with contextlib.suppress(Exception):
+                await message.reply(
+                    "❌ <b>Something broke on my end</b>",
+                    reply_markup=failed_kb(parsed.provider, parsed.entity_id),
+                )
