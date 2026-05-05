@@ -9,6 +9,11 @@ class AuthError(SpotifyDownloaderError):
     """Failure obtaining or using a Spotify access token."""
 
 
+class TokenExpiredError(SpotifyDownloaderError):
+    """Spotify endpoint returned 401 — the cached bearer token went stale.
+    Caller should drop the token and retry with a freshly minted one."""
+
+
 class HandshakeError(SpotifyDownloaderError):
     """Failure during the librespot Diffie-Hellman / Shannon handshake."""
 

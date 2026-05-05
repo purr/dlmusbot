@@ -328,13 +328,25 @@ async def _build_results(
                         )
                         return [], "unsupported_url", 0
             except TrackNotFoundError:
-                return [], "unsupported_url", 0
+                return [], "track_not_found", 0
             except DlmusError as e:
-                logger.debug("inline url resolve: {}: {}", type(e).__name__, e)
-                return [], "unsupported_url", 0
+                # URL was recognised + claimed by a provider, so this is
+                # a fetch failure (token rotation, AP socket drop, region
+                # lock, etc.) — not a genuinely unsupported URL. Surface
+                # it as such so the user knows to retry instead of
+                # assuming the platform isn't wired up.
+                logger.warning(
+                    "inline url fetch failed [{}:{}:{}]: {}: {}",
+                    parsed.provider, parsed.kind, parsed.entity_id,
+                    type(e).__name__, e,
+                )
+                return [], "url_fetch_failed", 0
             except Exception:
-                logger.exception("inline url resolve failed")
-                return [], "unsupported_url", 0
+                logger.exception(
+                    "inline url resolve crashed [{}:{}:{}]",
+                    parsed.provider, parsed.kind, parsed.entity_id,
+                )
+                return [], "url_fetch_failed", 0
 
     tasks: list[asyncio.Task[list[Track]]] = []
     for name in search_providers:
@@ -485,6 +497,12 @@ async def on_inline_query(
     # results instead of a generic "No results".
     if mode == "unsupported_url":
         switch_pm_text: Optional[str] = "❌ Unsupported URL"
+    elif mode == "url_fetch_failed":
+        # URL was recognised + claimed by a provider but the lookup
+        # itself failed (token rotation, AP socket drop, region lock,
+        # ...). Surface as a retry-friendly hint instead of pretending
+        # the URL is unsupported.
+        switch_pm_text = "⚠️ Couldn't load that link — try again"
     elif mode == "track_not_found":
         switch_pm_text = "❌ Track ID not found"
     elif mode == "artist_not_found":

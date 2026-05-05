@@ -28,6 +28,7 @@ from core.http_retry import get_with_retry
 from core.models import Album, ArtistRef, Playlist, Track
 
 from ._internal.auth import DEFAULT_HEADERS
+from ._internal.exceptions import TokenExpiredError
 
 API_BASE = "https://api.spotify.com/v1"
 
@@ -110,6 +111,8 @@ async def _get(
     except aiohttp.ClientError as e:
         raise ProviderError(f"spotify network error: {e}") from e
     async with r:
+        if r.status == 401:
+            raise TokenExpiredError(f"spotify {url} 401 (token expired)")
         if r.status == 404:
             raise TrackNotFoundError(f"spotify {url} not found")
         if r.status != 200:
@@ -191,7 +194,7 @@ async def search_tracks(
         async with http.get(url, headers=headers, params=params) as r:
             if r.status == 401:
                 # Token went stale mid-flight; let the caller refresh.
-                raise ProviderError("spotify searchview 401 (token expired)")
+                raise TokenExpiredError("spotify searchview 401 (token expired)")
             if r.status != 200:
                 body = (await r.text())[:200]
                 raise ProviderError(f"spotify searchview {r.status}: {body}")

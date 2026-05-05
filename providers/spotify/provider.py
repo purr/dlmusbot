@@ -28,6 +28,7 @@ from ._internal.exceptions import (
     HandshakeError,
     LoginError,
     MercuryError,
+    TokenExpiredError,
     TrackUnavailableError,
 )
 from ._internal.ids import base62_to_gid, parse_track_id
@@ -53,8 +54,14 @@ _SESSION_RETRY_DELAY_S = 0.4  # multiplied by attempt number for gentle backoff
 log = logging.getLogger(__name__)
 
 
-# Token cache TTL — Spotify tokens last ~1h; refresh after 50min.
+# Token cache TTL — fallback when the auth response doesn't include a
+# usable expiry. Real Spotify tokens last ~1h; we refresh after 50 min so
+# in-flight requests don't race a server-side rotation.
 TOKEN_TTL_SECONDS = 50 * 60
+
+# Safety window — refresh the token this many seconds *before* its declared
+# expiry so we don't ship a token that dies mid-request on the wire.
+TOKEN_REFRESH_LEEWAY_S = 60
 
 # Audio formats we'll ask librespot for, ordered highest-quality-first.
 # Only OGG_VORBIS variants are listed because they're the only librespot-
@@ -188,6 +195,12 @@ class SpotifyProvider(Provider):
         self._http: Optional[aiohttp.ClientSession] = None
         self._token: Optional[str] = None
         self._token_fetched_at: float = 0.0
+        self._token_expires_at: float = 0.0
+        # Serialise concurrent token refreshes — without this, N parallel
+        # inline searches that all hit a stale token would each fire their
+        # own /api/token request (and TOTP secret fetch), hammering Spotify
+        # for nothing.
+        self._token_lock = asyncio.Lock()
         # Long-lived librespot AP socket. Cached so we don't pay the DH+login
         # handshake (~hundreds of ms) on every track. Recreated lazily after
         # a connection drop or auth-token rotation.
@@ -213,15 +226,65 @@ class SpotifyProvider(Provider):
             await self._http.close()
             self._http = None
 
-    async def _access_token(self) -> str:
+    async def _access_token(self, *, force_refresh: bool = False) -> str:
+        """Return a valid bearer token.
+
+        Honours `accessTokenExpirationTimestampMs` from Spotify's /api/token
+        response when present (so we refresh as the server rotates rather
+        than guessing) and falls back to TOKEN_TTL_SECONDS otherwise. Pass
+        `force_refresh=True` after a 401 to invalidate the cache and mint
+        a fresh token even if the cached one *looks* valid by clock."""
         now = time.time()
-        if self._token and (now - self._token_fetched_at) < TOKEN_TTL_SECONDS:
+        if (
+            not force_refresh
+            and self._token
+            and now < self._token_expires_at
+        ):
             return self._token
-        assert self._http is not None
-        token_info = await get_access_token(self._sp_dc, session=self._http)
-        self._token = token_info["accessToken"]
-        self._token_fetched_at = now
-        return self._token
+        async with self._token_lock:
+            now = time.time()
+            # Re-check inside the lock so the loser of a refresh race
+            # picks up the freshly minted token instead of doing its own
+            # round-trip.
+            if (
+                not force_refresh
+                and self._token
+                and now < self._token_expires_at
+            ):
+                return self._token
+            assert self._http is not None
+            token_info = await get_access_token(self._sp_dc, session=self._http)
+            self._token = token_info["accessToken"]
+            self._token_fetched_at = now
+            expiry_ms = token_info.get("accessTokenExpirationTimestampMs")
+            if isinstance(expiry_ms, (int, float)) and expiry_ms > 0:
+                self._token_expires_at = (
+                    expiry_ms / 1000.0 - TOKEN_REFRESH_LEEWAY_S
+                )
+            else:
+                self._token_expires_at = now + TOKEN_TTL_SECONDS
+            _log.info(
+                "[spotify] minted access token (expires in {:.0f}s)",
+                max(0.0, self._token_expires_at - now),
+            )
+            return self._token
+
+    async def _with_token_retry(
+        self, fn: Callable[[str], Awaitable[T]],
+    ) -> T:
+        """Run a token-using HTTP call, refreshing once on a 401. Spotify
+        rotates bearer tokens server-side without warning, and our local
+        cache only refreshes when the clock says it should — so a token
+        that *looks* fresh can still 401 mid-flight. Catching the
+        TokenExpiredError sentinel and retrying with a freshly minted
+        token absorbs that case transparently."""
+        token = await self._access_token()
+        try:
+            return await fn(token)
+        except TokenExpiredError:
+            log.info("spotify access token rejected (401), refreshing once")
+            token = await self._access_token(force_refresh=True)
+            return await fn(token)
 
     # ---- session caching -------------------------------------------------
 
@@ -298,10 +361,13 @@ class SpotifyProvider(Provider):
     # ---- search / fetch --------------------------------------------------
 
     async def search(self, query: str, limit: int = 25) -> list[Track]:
+        assert self._http is not None
         try:
-            token = await self._access_token()
-            assert self._http is not None
-            return await search_mod.search_tracks(self._http, token, query, limit)
+            return await self._with_token_retry(
+                lambda tok: search_mod.search_tracks(
+                    self._http, tok, query, limit,
+                )
+            )
         except SpotifyDownloaderError as e:
             raise ProviderError(f"spotify search failed: {e}") from e
 
@@ -401,25 +467,40 @@ class SpotifyProvider(Provider):
         # Mercury fetches for metadata. Capped at PLAYLIST_TRACK_LIMIT so
         # absurdly long Spotify mixes don't blow past the inline-query
         # deadline (each Mercury hop is ~50ms, serialised by Session._lock).
-        token = await self._access_token()
         assert self._http is not None
         url = f"{search_mod.PLAYLIST_V2_BASE}/{entity_id}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            **search_mod.SPCLIENT_HEADERS,
-        }
-        try:
-            async with self._http.get(url, headers=headers) as r:
-                if r.status == 404:
-                    return None
-                if r.status != 200:
-                    body = (await r.text())[:200]
-                    raise ProviderError(
-                        f"spotify playlist {entity_id} -> {r.status}: {body}"
-                    )
-                data = await r.json(content_type=None)
-        except aiohttp.ClientError as e:
-            raise ProviderError(f"spotify playlist network error: {e}") from e
+
+        async def _load(token: str) -> Optional[dict]:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                **search_mod.SPCLIENT_HEADERS,
+            }
+            try:
+                async with self._http.get(url, headers=headers) as r:
+                    if r.status == 401:
+                        # Bubble up so _with_token_retry refreshes the
+                        # token; without this a stale spclient token
+                        # would surface to the user as "playlist not
+                        # found" or generic 401.
+                        raise TokenExpiredError(
+                            f"spotify playlist {entity_id} 401 (token expired)"
+                        )
+                    if r.status == 404:
+                        return None
+                    if r.status != 200:
+                        body = (await r.text())[:200]
+                        raise ProviderError(
+                            f"spotify playlist {entity_id} -> {r.status}: {body}"
+                        )
+                    return await r.json(content_type=None)
+            except aiohttp.ClientError as e:
+                raise ProviderError(
+                    f"spotify playlist network error: {e}"
+                ) from e
+
+        data = await self._with_token_retry(_load)
+        if data is None:
+            return None
 
         title = (data.get("attributes") or {}).get("name") or "<unknown>"
         owner = data.get("ownerUsername")
