@@ -21,7 +21,7 @@ from aiogram.types import (
 )
 from loguru import logger
 
-from core.exceptions import DlmusError, TrackNotFoundError, UnsupportedURLError
+from core.exceptions import DlmusError, ProviderError, TrackNotFoundError, UnsupportedURLError
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
 from core.url_parser import ParsedURL, parse_all
@@ -30,6 +30,7 @@ from providers.registry import Registry
 from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
 from ..status import failed_kb, placeholder_kb
+from ..status import final_failed_kb
 from ..ui import PREPARING_TEXT
 
 
@@ -166,6 +167,12 @@ async def _enqueue_url(
             t = _track_from_json(data)
             if t is None:
                 raise TrackNotFoundError("could not parse SoundCloud track")
+            if (t.extra or {}).get("is_goplus"):
+                await message.reply(
+                    "❌ <b>Couldn't grab that link</b>",
+                    reply_markup=final_failed_kb("goplus"),
+                )
+                return
             await _enqueue_track(
                 provider, t, message, job_runner, queue,
                 request_query=parsed.url,
@@ -217,6 +224,13 @@ async def on_dm_text(
     for parsed in urls:
         try:
             await _enqueue_url(parsed, message, registry, job_runner, queue)
+        except ProviderError as e:
+            logger.warning("dm enqueue failed [{}]: {}", parsed.url, e)
+            with contextlib.suppress(Exception):
+                await message.reply(
+                    "❌ <b>Couldn't grab that link</b>",
+                    reply_markup=final_failed_kb(e.reason) if e.reason else failed_kb(parsed.provider, parsed.entity_id),
+                )
         except DlmusError as e:
             logger.warning("dm enqueue failed [{}]: {}", parsed.url, e)
             with contextlib.suppress(Exception):

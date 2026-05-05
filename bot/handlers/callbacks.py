@@ -23,12 +23,12 @@ from aiogram.types import CallbackQuery
 from loguru import logger
 
 from core.cache import FileIdCache
-from core.exceptions import DlmusError
+from core.exceptions import DlmusError, ProviderError
 from providers.registry import Registry
 
 from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
-from ..status import failed_kb, lookup_status_alert, permission_required_kb
+from ..status import failed_kb, final_failed_kb, lookup_status_alert, permission_required_kb
 
 router = Router(name="callbacks")
 
@@ -100,6 +100,16 @@ async def on_download(
 
     try:
         track = await provider.get_track(track_id)
+    except ProviderError as e:
+        logger.warning("callback track fetch failed [{}:{}]: {}", provider_name, track_id, e)
+        if target.inline_message_id:
+            with contextlib.suppress(TelegramBadRequest):
+                await cb.bot.edit_message_reply_markup(
+                    inline_message_id=target.inline_message_id,
+                    reply_markup=final_failed_kb(e.reason) if e.reason else failed_kb(provider_name, track_id),
+                )
+        await cb.answer("Couldn't fetch that one. Try again?")
+        return
     except DlmusError as e:
         logger.warning("callback track fetch failed [{}:{}]: {}", provider_name, track_id, e)
         if target.inline_message_id:

@@ -14,12 +14,12 @@ from aiogram.types import ChosenInlineResult
 from loguru import logger
 
 from core.cache import FileIdCache
-from core.exceptions import DlmusError
+from core.exceptions import DlmusError, ProviderError
 from providers.registry import Registry
 
 from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
-from ..status import failed_kb, permission_required_kb
+from ..status import failed_kb, final_failed_kb, permission_required_kb
 
 router = Router(name="chosen")
 
@@ -74,6 +74,15 @@ async def on_chosen(
 
     try:
         track = await provider.get_track(track_id)
+    except ProviderError as e:
+        logger.warning("inline track fetch failed [{}:{}]: {}", provider_name, track_id, e)
+        if inline_msg_id:
+            with contextlib.suppress(TelegramBadRequest):
+                await chosen.bot.edit_message_reply_markup(
+                    inline_message_id=inline_msg_id,
+                    reply_markup=final_failed_kb(e.reason) if e.reason else failed_kb(provider_name, track_id),
+                )
+        return
     except DlmusError as e:
         logger.warning("inline track fetch failed [{}:{}]: {}", provider_name, track_id, e)
         if inline_msg_id:

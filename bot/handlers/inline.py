@@ -39,7 +39,7 @@ from aiogram.types import (
 from loguru import logger
 
 from core.cache import FileIdCache
-from core.exceptions import DlmusError, TrackNotFoundError
+from core.exceptions import DlmusError, ProviderError, TrackNotFoundError
 from core.fuzz import dedupe_tracks, rank_balanced
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
@@ -211,6 +211,16 @@ async def _build_results(
             return [], "unsupported_url", 0
         try:
             t = await provider.get_track(track_id)
+            if provider_name == "soundcloud":
+                from providers.soundcloud.provider import SoundCloudProvider  # noqa: SLF001
+                if isinstance(provider, SoundCloudProvider):
+                    await provider.preflight_track(t)
+        except ProviderError as e:
+            if e.reason == "goplus":
+                return [], "goplus_blocked", 0
+            if e.reason == "unavailable":
+                return [], "track_unavailable", 0
+            return [], "track_not_found", 0
         except TrackNotFoundError:
             return [], "track_not_found", 0
         except DlmusError as e:
@@ -251,7 +261,19 @@ async def _build_results(
         if provider is not None:
             try:
                 if parsed.kind == "track":
-                    return [await provider.get_track(parsed.entity_id)], "single", 1
+                    try:
+                        t = await provider.get_track(parsed.entity_id)
+                        if parsed.provider == "soundcloud":
+                            from providers.soundcloud.provider import SoundCloudProvider  # noqa: SLF001
+                            if isinstance(provider, SoundCloudProvider):
+                                await provider.preflight_track(t)
+                        return [t], "single", 1
+                    except ProviderError as e:
+                        if e.reason == "goplus":
+                            return [], "goplus_blocked", 0
+                        if e.reason == "unavailable":
+                            return [], "track_unavailable", 0
+                        raise
                 if parsed.kind == "album":
                     album = await provider.get_album(parsed.entity_id)
                     if album is None:
@@ -295,6 +317,10 @@ async def _build_results(
                             return [], "unsupported_url", 0
                         if kind == "track":
                             t = _track_from_json(data)
+                            if t is not None and (t.extra or {}).get("is_goplus"):
+                                return [], "goplus_blocked", 0
+                            if t is not None:
+                                await provider.preflight_track(t)
                             return ([t] if t else []), "single", (1 if t else 0)
                         if kind == "playlist":
                             # Delegate to the album/playlist resolver so
@@ -505,6 +531,10 @@ async def on_inline_query(
         switch_pm_text = "⚠️ Couldn't load that link — try again"
     elif mode == "track_not_found":
         switch_pm_text = "❌ Track ID not found"
+    elif mode == "goplus_blocked":
+        switch_pm_text = "❌ SoundCloud Go+ track can't be downloaded"
+    elif mode == "track_unavailable":
+        switch_pm_text = "❌ Track unavailable for download"
     elif mode == "artist_not_found":
         switch_pm_text = "❌ Artist not found"
     elif mode == "artist_empty":

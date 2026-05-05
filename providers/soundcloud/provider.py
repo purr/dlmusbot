@@ -112,8 +112,27 @@ def _track_from_json(data: dict) -> Optional[Track]:
             # before pulling 30s of audio that we can't deliver anyway.
             "policy": data.get("policy"),
             "monetization_model": data.get("monetization_model"),
+            "is_goplus": _is_goplus_json(data),
         },
     )
+
+
+def _is_goplus_json(data: dict) -> bool:
+    """Best-effort Go+ detector for SoundCloud tracks.
+
+    `policy == "SNIP"` is the canonical flag for snippet-only playback.
+    Some responses are sparse, so we also treat "all transcodings are
+    snipped previews" as Go+ fallback evidence.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("policy") == "SNIP":
+        return True
+    media = data.get("media") or {}
+    transcodings = media.get("transcodings") or []
+    if transcodings and all(bool(t.get("snipped")) for t in transcodings):
+        return True
+    return False
 
 
 def _transcoding_rank(t: dict) -> tuple[int, int, int]:
@@ -154,6 +173,16 @@ def _pick_transcoding(
         return None
     full = [t for t in transcodings if not t.get("snipped")]
     pool = full or transcodings
+    # Skip encrypted transport variants - we can only ingest plain
+    # `progressive` and `hls` streams. Encrypted HLS protocols can
+    # resolve but yield unusable output in our downloader path.
+    compatible_protocols = {"progressive", "hls"}
+    protocol_ok = [
+        t for t in pool
+        if ((t.get("format") or {}).get("protocol") or "").lower() in compatible_protocols
+    ]
+    if protocol_ok:
+        pool = protocol_ok
     if not allow_hls_fmp4:
         compatible: list[dict] = []
         for t in pool:
@@ -166,6 +195,37 @@ def _pick_transcoding(
         if compatible:
             pool = compatible
     return max(pool, key=_transcoding_rank)
+
+
+def _candidate_transcodings(
+    transcodings: list[dict],
+    *,
+    allow_hls_fmp4: bool = True,
+) -> list[dict]:
+    """Compatible transcodings sorted best-first."""
+    if not transcodings:
+        return []
+    full = [t for t in transcodings if not t.get("snipped")]
+    pool = full or transcodings
+    compatible_protocols = {"progressive", "hls"}
+    protocol_ok = [
+        t for t in pool
+        if ((t.get("format") or {}).get("protocol") or "").lower() in compatible_protocols
+    ]
+    if protocol_ok:
+        pool = protocol_ok
+    if not allow_hls_fmp4:
+        compatible: list[dict] = []
+        for t in pool:
+            fmt = t.get("format") or {}
+            mime = (fmt.get("mime_type") or "").lower()
+            proto = (fmt.get("protocol") or "").lower()
+            is_hls_fmp4 = proto == "hls" and ("aac" in mime or "mp4" in mime)
+            if not is_hls_fmp4:
+                compatible.append(t)
+        if compatible:
+            pool = compatible
+    return sorted(pool, key=_transcoding_rank, reverse=True)
 
 
 def _format_metadata(t: dict) -> tuple[str, str, str]:
@@ -237,7 +297,8 @@ class SoundCloudProvider(Provider):
 
     async def search(self, query: str, limit: int = 25) -> list[Track]:
         items = await self._api.search_tracks(query, limit=limit)
-        return [t for t in (_track_from_json(i) for i in items) if t]
+        tracks = [t for t in (_track_from_json(i) for i in items) if t]
+        return [t for t in tracks if not (t.extra or {}).get("is_goplus")]
 
     async def get_track(self, entity_id: str) -> Track:
         if entity_id.isdigit():
@@ -246,6 +307,11 @@ class SoundCloudProvider(Provider):
             data = await self._api.resolve(entity_id)
         if data.get("kind") != "track":
             raise TrackNotFoundError(f"{entity_id} is a {data.get('kind')}, not a track")
+        if _is_goplus_json(data):
+            raise ProviderError(
+                f"soundcloud track {entity_id} is Go+ (snippet only)",
+                reason="goplus",
+            )
         t = _track_from_json(data)
         if t is None:
             raise TrackNotFoundError(f"soundcloud {entity_id} not found")
@@ -257,6 +323,43 @@ class SoundCloudProvider(Provider):
         without doing the request twice."""
         data = await self._api.resolve(entity_id)
         return (data.get("kind") or "unknown"), data
+
+    async def preflight_track(self, track: Track) -> None:
+        """Fail fast when no playable stream URL can be resolved."""
+        transcodings = (track.extra or {}).get("transcodings") or []
+        if not transcodings:
+            full = await self.get_track(track.track_id)
+            transcodings = (full.extra or {}).get("transcodings") or []
+            track = full
+        if (track.extra or {}).get("is_goplus") or (track.extra or {}).get("policy") == "SNIP":
+            raise ProviderError(
+                f"soundcloud track {track.track_id} is Go+ (snippet only)",
+                reason="goplus",
+            )
+        candidates = _candidate_transcodings(
+            transcodings,
+            allow_hls_fmp4=ffmpeg_available(),
+        )
+        if not candidates:
+            if transcodings and all(bool(t.get("snipped")) for t in transcodings):
+                raise ProviderError(
+                    f"soundcloud track {track.track_id} is Go+ (snippet only)",
+                    reason="goplus",
+                )
+            raise ProviderError(
+                f"no transcodings for soundcloud track {track.track_id}",
+                reason="unavailable",
+            )
+        for cand in candidates:
+            try:
+                await self._api.transcoding_url(cand["url"])
+                return
+            except ProviderError:
+                continue
+        raise ProviderError(
+            f"no playable transcodings for soundcloud track {track.track_id}",
+            reason="unavailable",
+        )
 
     async def get_album(self, entity_id: str) -> Optional[Album]:
         data = await self._api.resolve(entity_id)
@@ -389,18 +492,22 @@ class SoundCloudProvider(Provider):
         # serve us 30-second previews, no full audio. Surface as a
         # permanent failure with a goplus reason so the bot shows the
         # right user-facing message instead of retrying / fallback.
-        policy = (track.extra or {}).get("policy")
-        if policy == "SNIP":
+        if (track.extra or {}).get("is_goplus") or (track.extra or {}).get("policy") == "SNIP":
             raise ProviderError(
                 f"soundcloud track {track.track_id} is Go+ (snippet only)",
                 reason="goplus",
             )
 
-        chosen = _pick_transcoding(
+        candidates = _candidate_transcodings(
             transcodings,
             allow_hls_fmp4=ffmpeg_available(),
         )
-        if chosen is None:
+        if not candidates:
+            if transcodings and all(bool(t.get("snipped")) for t in transcodings):
+                raise ProviderError(
+                    f"soundcloud track {track.track_id} is Go+ (snippet only)",
+                    reason="goplus",
+                )
             # No usable streams + no Go+ flag → likely region-locked or
             # taken down. Surface as `unavailable` for the right popup.
             raise ProviderError(
@@ -408,8 +515,22 @@ class SoundCloudProvider(Provider):
                 reason="unavailable",
             )
 
+        chosen: Optional[dict] = None
+        stream_url: Optional[str] = None
+        for candidate in candidates:
+            try:
+                stream_url = await self._api.transcoding_url(candidate["url"])
+                chosen = candidate
+                break
+            except ProviderError:
+                continue
+        if chosen is None or stream_url is None:
+            raise ProviderError(
+                f"no playable transcodings for soundcloud track {track.track_id}",
+                reason="unavailable",
+            )
+
         format_name, ext, mime = _format_metadata(chosen)
-        stream_url = await self._api.transcoding_url(chosen["url"])
         protocol = (chosen.get("format") or {}).get("protocol") or "progressive"
 
         Path(dest_dir).mkdir(parents=True, exist_ok=True)
@@ -430,6 +551,16 @@ class SoundCloudProvider(Provider):
             await _download_hls(self._api.http, stream_url, out_path, ext)
 
         size = out_path.stat().st_size
+        if size == 0:
+            if transcodings and all(bool(t.get("snipped")) for t in transcodings):
+                raise ProviderError(
+                    f"soundcloud track {track.track_id} is Go+ (snippet only)",
+                    reason="goplus",
+                )
+            raise ProviderError(
+                f"downloaded empty file for soundcloud track {track.track_id}",
+                reason="unavailable",
+            )
         return DownloadResult(
             track=track,
             file_path=str(out_path),
