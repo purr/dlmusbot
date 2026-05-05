@@ -168,7 +168,11 @@ def format_onboarding_message(username: str, visible_providers: frozenset[str]) 
 
 
 def format_start_message(username: str, visible_providers: frozenset[str]) -> str:
-    return format_onboarding_message(username, visible_providers)
+    return (
+        format_onboarding_message(username, visible_providers)
+        + "\n\n"
+        + "<i>Tip: mute this bot and archive the chat so downloads stay out of the way.</i>"
+    )
 
 
 def format_inline_empty_message(username: str, visible_providers: frozenset[str]) -> str:
