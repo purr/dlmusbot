@@ -77,6 +77,41 @@ def _looks_like_url(text: str) -> bool:
     return bool(_URL_LIKE_RE.fullmatch(text.strip()))
 
 
+# Power-user shortcut: `<provider>:<track_id>` skips search entirely and
+# fetches the track straight from the provider. Useful when you've copied
+# an ID out of a log line or another tool and don't want to round-trip
+# through a URL. Aliases mirror common shorthands; resolution always lands
+# on the canonical registry name.
+_DIRECT_ID_PROVIDER_ALIASES: dict[str, str] = {
+    "spotify": "spotify",
+    "sp": "spotify",
+    "soundcloud": "soundcloud",
+    "sc": "soundcloud",
+    "youtube": "youtube_music",
+    "youtube_music": "youtube_music",
+    "ytm": "youtube_music",
+    "yt": "youtube_music",
+}
+
+_DIRECT_ID_RE = re.compile(
+    r"^(?P<provider>[A-Za-z_]+):(?P<track_id>[A-Za-z0-9_-]+)\s*$"
+)
+
+
+def _parse_direct_id(text: str) -> Optional[tuple[str, str]]:
+    """`(canonical_provider_name, track_id)` if `text` matches the direct
+    `provider:id` shortcut, else None. Stays restrictive: alphanumerics +
+    `_`/`-` for the id portion, alphabetic for the provider, no spaces."""
+    m = _DIRECT_ID_RE.match(text)
+    if not m:
+        return None
+    alias = m.group("provider").lower()
+    canonical = _DIRECT_ID_PROVIDER_ALIASES.get(alias)
+    if not canonical:
+        return None
+    return canonical, m.group("track_id")
+
+
 # Generic fallback thumbnail when a track has no artwork. Hosted on
 # catbox so we don't lean on a provider-branded asset (the old SoundCloud
 # logo made search results look SC-only even when most hits were Spotify).
@@ -168,6 +203,29 @@ async def _build_results(
     total   — *uncapped* hit count behind the response. The UI uses
               this for the "Found N tracks" header so the user sees
               the real total even when display is truncated."""
+    direct = _parse_direct_id(query)
+    if direct is not None:
+        provider_name, track_id = direct
+        provider = registry.get(provider_name)
+        if provider is None:
+            return [], "unsupported_url", 0
+        try:
+            t = await provider.get_track(track_id)
+        except TrackNotFoundError:
+            return [], "track_not_found", 0
+        except DlmusError as e:
+            logger.debug(
+                "direct-id lookup failed [{}:{}]: {}: {}",
+                provider_name, track_id, type(e).__name__, e,
+            )
+            return [], "track_not_found", 0
+        except Exception:
+            logger.exception(
+                "direct-id lookup crashed [%s:%s]", provider_name, track_id,
+            )
+            return [], "track_not_found", 0
+        return ([t] if t else []), "single", (1 if t else 0)
+
     parsed = parse_url(query, registry)
     if parsed is None and _looks_like_url(query):
         # User typed a URL that no provider claims. Don't pretend it's a
@@ -427,6 +485,8 @@ async def on_inline_query(
     # results instead of a generic "No results".
     if mode == "unsupported_url":
         switch_pm_text: Optional[str] = "❌ Unsupported URL"
+    elif mode == "track_not_found":
+        switch_pm_text = "❌ Track ID not found"
     elif mode == "artist_not_found":
         switch_pm_text = "❌ Artist not found"
     elif mode == "artist_empty":

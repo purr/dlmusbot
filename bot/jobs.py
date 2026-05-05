@@ -245,19 +245,21 @@ class JobRunner:
 
         # Upfront feasibility check: Telegram caps bot uploads at 50 MB.
         # If the track is so long that even compressing to the lowest
-        # listenable bitrate (128 kbps) won't fit, surface the failure
-        # *now* — better than letting the user wait through a 2-minute
-        # download just to bonk on the cap. Any duration that fits at
-        # MIN_LISTENABLE_KBPS is allowed through; we'll re-encode after
+        # listenable bitrate (`MIN_LISTENABLE_KBPS`) won't fit, surface the
+        # failure *now* — better than letting the user wait through a
+        # 2-minute download just to bonk on the cap. Any duration that
+        # fits at the floor is allowed through; we'll re-encode after
         # download if needed (see fit-to-cap block below).
         if track.duration_seconds > 0:
-            min_possible_mb = estimate_size_mb(track.duration_seconds, 128)
+            min_possible_mb = estimate_size_mb(
+                track.duration_seconds, MIN_LISTENABLE_KBPS,
+            )
             if min_possible_mb > self._max_file_mb:
                 logger.warning(
-                    "[{}] track {} is {} long — even at 128 kbps would be "
+                    "[{}] track {} is {} long — even at {} kbps would be "
                     "{:.1f} MB, exceeds {} MB cap; failing fast",
                     tag, track.track_id, track.duration_str,
-                    min_possible_mb, self._max_file_mb,
+                    MIN_LISTENABLE_KBPS, min_possible_mb, self._max_file_mb,
                 )
                 await self._mark_dead("too_long", target, track)
                 return
