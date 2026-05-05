@@ -40,7 +40,9 @@ from aiogram.types import (
 from loguru import logger
 
 from core.audio_convert import (
+    MIN_LISTENABLE_KBPS,
     estimate_size_mb,
+    probe_bitrate_kbps,
     target_bitrate_for_size,
     trim_long_edge_silence,
     transcode_to_mp3,
@@ -387,9 +389,19 @@ class JobRunner:
             # invariant "we never upload OGG" holds across the whole bot.
             ext_now = Path(result.file_path).suffix.lower()
             if ext_now in (".ogg", ".opus"):
-                source_kbps = _guess_source_kbps(result.format_name) or 320
+                # Match source bitrate so we don't waste bytes (or worse,
+                # falsely imply higher quality than the lossy source can
+                # actually carry). Order: parsed format string → ffprobe
+                # of the file → 320 kbps last-resort fallback. Never
+                # exceed 320 since standard MP3 caps there anyway.
+                source_kbps = (
+                    _guess_source_kbps(result.format_name)
+                    or await probe_bitrate_kbps(result.file_path)
+                    or 320
+                )
+                source_kbps = min(source_kbps, 320)
                 logger.info(
-                    "[{}] {} detected; transcoding to MP3 {} kbps for telegram compatibility",
+                    "[{}] {} detected; transcoding to MP3 {} kbps (matching source)",
                     tag, ext_now.lstrip("."), source_kbps,
                 )
                 mp3_path = await transcode_to_mp3(

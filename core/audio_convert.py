@@ -28,8 +28,10 @@ from loguru import logger
 
 # Lower bound for "still listenable" MP3 CBR. Below this, re-encoding to
 # fit a size cap produces audibly compromised audio (bubbly highs, slurred
-# transients) and we'd rather fail fast than ship junk.
-MIN_LISTENABLE_KBPS = 128
+# transients) and we'd rather fail fast than ship junk. Set to 96 so long
+# DJ mixes / podcasts can still squeeze under Telegram's 50 MB cap — at
+# 96 kbps a ~70-minute set fits.
+MIN_LISTENABLE_KBPS = 96
 
 # Conservative source-bitrate assumption used for upfront duration → size
 # estimates before we've actually downloaded anything. Spotify hands us
@@ -48,30 +50,45 @@ def estimate_size_mb(duration_seconds: int, bitrate_kbps: int) -> float:
     return raw * 1.02
 
 
+# Standard MPEG-1 Layer III CBR bitrates. Snapping to these instead of
+# arbitrary numbers means the LAME encoder doesn't have to negotiate a
+# nearby legal rate, and keeps the encoded file size predictable.
+MP3_STANDARD_KBPS: tuple[int, ...] = (
+    32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+)
+
+
+# Fixed-byte overhead reserved for ID3v2 tags + embedded cover art when
+# fit-checking. Real overhead for typical Spotify covers is 50–200 KB;
+# 0.6 MB leaves comfortable headroom without the 2% multiplicative
+# margin used in `estimate_size_mb` (which costs ~1 MB at 50 MB and
+# pushes long mixes down a whole bitrate step unnecessarily).
+_FIT_HEADER_OVERHEAD_MB = 0.6
+
+
 def target_bitrate_for_size(
-    duration_seconds: int, target_mb: float, *, safety_margin: float = 0.95,
+    duration_seconds: int, target_mb: float, *, safety_margin: float = 1.0,
 ) -> int:
-    """Compute the highest CBR bitrate that fits `target_mb` for a track
-    of `duration_seconds`. Includes a safety margin so encoded files come
-    in under (not exactly at) the target. Returns 0 if even the lowest
-    listenable rate (`MIN_LISTENABLE_KBPS`) wouldn't fit."""
+    """Pick the highest standard MP3 CBR bitrate whose encoded payload
+    plus a fixed header reserve (`_FIT_HEADER_OVERHEAD_MB`) fits within
+    `target_mb`. Walks the standard-rates ladder from 320 kbps down so
+    we always land on the best quality that genuinely fits — no
+    multiplicative safety margins, no rate quantisation losses.
+    Returns 0 if even `MIN_LISTENABLE_KBPS` overshoots the target."""
     if duration_seconds <= 0:
         return 0
 
-    raw_kbps = int((target_mb * safety_margin * 8 * 1024) / duration_seconds)
-    # Round down to a "clean" bitrate (multiples of 16 kbps).
-    raw_kbps -= raw_kbps % 16
-
-    # If 128 kbps actually fits the target without safety margin, allow it
-    # even when safety-margined math rounds below 128 — clamp up rather
-    # than reject. Long tracks (~45-50 min) hit this exactly: real fit at
-    # 128 is fine, but safety_margin pushes the calc to ~112.
-    if estimate_size_mb(duration_seconds, MIN_LISTENABLE_KBPS) <= target_mb:
-        return min(max(raw_kbps, MIN_LISTENABLE_KBPS), 320)
-
-    if raw_kbps < MIN_LISTENABLE_KBPS:
+    payload_budget_mb = (target_mb * safety_margin) - _FIT_HEADER_OVERHEAD_MB
+    if payload_budget_mb <= 0:
         return 0
-    return min(raw_kbps, 320)
+
+    for kbps in reversed(MP3_STANDARD_KBPS):
+        if kbps < MIN_LISTENABLE_KBPS:
+            break
+        raw_mb = (duration_seconds * kbps) / 8 / 1024
+        if raw_mb <= payload_budget_mb:
+            return kbps
+    return 0
 
 
 class TranscodeError(RuntimeError):
@@ -122,6 +139,51 @@ def _probe_duration_sync(src: Path, timeout: float) -> float:
         return float(out)
     except ValueError as e:
         raise TranscodeError(f"ffprobe returned non-float duration: {out!r}") from e
+
+
+def _probe_bitrate_kbps_sync(src: Path, timeout: float) -> Optional[int]:
+    """Read the encoded stream bitrate in kbps from a file's container.
+    Returns None if ffprobe doesn't report it (some containers omit
+    per-stream bitrate). Used to cap MP3 transcode targets at the
+    source rate so we never spend bits encoding a 96 kbps OGG to
+    320 kbps MP3 — that's pure file-size waste with zero quality gain."""
+    try:
+        out = _run_capture(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=bit_rate:format=bit_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(src),
+            ],
+            timeout=timeout,
+        ).strip()
+    except TranscodeError:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.lower() == "n/a":
+            continue
+        try:
+            bps = int(line)
+        except ValueError:
+            continue
+        if bps > 0:
+            return max(1, bps // 1000)
+    return None
+
+
+async def probe_bitrate_kbps(
+    src_path: str | Path, *, timeout: float = 10.0,
+) -> Optional[int]:
+    """Async wrapper for `_probe_bitrate_kbps_sync`. None when the source
+    bitrate can't be determined (caller should fall back to a safe
+    default rather than over-encoding)."""
+    src = Path(src_path)
+    if not src.is_file() or not ffmpeg_available():
+        return None
+    return await asyncio.to_thread(_probe_bitrate_kbps_sync, src, timeout)
 
 
 def _detect_silence_events_sync(

@@ -46,9 +46,7 @@ STATUS_ALERTS: dict[str, str] = {
     "fitting": "Compressing the file to fit the upload size limit.",
     "tagging": "Adding cover art and metadata.",
     "uploading": "Sending the file.",
-    "reencoded": (
-        "This file was re-encoded to MP3 to fit the upload size limit."
-    ),
+    "reencoded": "This file was re-encoded to fit the upload size limit.",
     "failed": "Couldn't download — tap Try Again to retry.",
     "final_failed": "Couldn't download. Try a different track or service.",
     "final_failed:too_long": ("This track is too long to upload to Telegram, sorry!"),
@@ -80,8 +78,8 @@ def lookup_status_alert(stage_key: str) -> str:
         try:
             kbps = int(stage_key.split(":", 1)[1])
             return (
-                f"This file was re-encoded to {kbps} kbps MP3 to fit "
-                "the upload size limit."
+                f"This file was re-encoded to {kbps} kbps to fit the "
+                "upload size limit."
             )
         except (ValueError, IndexError):
             pass
@@ -186,7 +184,7 @@ def reencoded_warning_button(kbps: Optional[int] = None) -> InlineKeyboardButton
     in the callback so the popup alert can be specific
     (`Re-encoded to 128 kbps MP3...`)."""
     if kbps and kbps > 0:
-        text = f"⚠️ Re-encoded to {kbps} kbps MP3"
+        text = f"⚠️ Re-encoded to {kbps} kbps"
         cb = f"status:reencoded:{kbps}"
     else:
         text = "⚠️ Re-encoded to fit size limit"
@@ -278,20 +276,16 @@ def inline_audio_kb(
     reencoded_kbps: Optional[int] = None,
 ) -> Optional[InlineKeyboardMarkup]:
     """Buttons attached to the delivered inline audio (after the article
-    swap via edit_message_media). Mirrors `audio_kb` so users see source +
-    artist links and the re-encoded warning even when they downloaded via
-    inline mode. Returns None when nothing useful would be shown — that
-    way the inline message ends up clean (no buttons) for normal-fit
-    deliveries, matching purr's original behaviour."""
-    rows: list[list[InlineKeyboardButton]] = []
-    r1 = _row_source_artist(track)
-    if r1:
-        rows.append(r1)
-    if reencoded_kbps:
-        rows.append([reencoded_warning_button(reencoded_kbps)])
-    if not rows:
+    swap via edit_message_media). Inline mode stays clean — no source /
+    artist links — only the permanent "re-encoded to N kbps MP3"
+    indicator when applicable. Returns None for normal-fit deliveries so
+    the inline message ends up button-less, matching purr's original
+    behaviour."""
+    if not reencoded_kbps:
         return None
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[reencoded_warning_button(reencoded_kbps)]],
+    )
 
 
 def failed_kb(provider: str, track_id: str) -> InlineKeyboardMarkup:
