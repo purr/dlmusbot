@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand
 
+from core import stats as bot_stats
 from core.cache import FileIdCache
 from core.queue import DownloadQueue
 from providers.registry import build_default_registry
@@ -23,6 +24,7 @@ log = logging.getLogger(__name__)
 async def _set_default_commands(bot: Bot) -> None:
     await bot.set_my_commands([
         BotCommand(command="start", description="Intro and how to use the bot"),
+        BotCommand(command="stats", description="Delivery stats (rolling windows)"),
     ])
 
 
@@ -36,6 +38,9 @@ async def run(cfg: Any) -> None:
     await registry.start_all()
 
     cache = FileIdCache(cfg.CACHE_FILE)
+    stats_file = getattr(cfg, "STATS_FILE", "") or "data/bot_stats.json"
+    bot_stats.configure(stats_file)
+    await bot_stats.load()
     queue: DownloadQueue = DownloadQueue(concurrency=cfg.DOWNLOAD_CONCURRENCY)
     await queue.start()
 
@@ -88,5 +93,6 @@ async def run(cfg: Any) -> None:
     finally:
         await queue.stop()
         await job_runner.close()
+        await bot_stats.shutdown_flush()
         await registry.close_all()
         await bot.session.close()

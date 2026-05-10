@@ -47,6 +47,7 @@ from core.audio_convert import (
     trim_long_edge_silence,
     transcode_to_mp3,
 )
+from core import stats as bot_stats
 from core.cache import CachedAudio, FileIdCache
 from core.exceptions import (
     DlmusError,
@@ -482,6 +483,9 @@ class JobRunner:
                 # (cache miss, etc.) starts the budget fresh.
                 if target.inline_message_id is not None:
                     self._inline_failures.pop(target.inline_message_id, None)
+                bot_stats.schedule_record(
+                    track.provider, track.track_id, target.user_id or 0,
+                )
             file_id_for_inline: Optional[str] = None
             # Only cache + use for inline when it's an audio file_id. Voice
             # file_ids can't drive the article→audio swap and would just
@@ -622,6 +626,9 @@ class JobRunner:
             original_spotify_url=target.original_spotify_url,
             reencoded=cached.reencoded,
             reencoded_kbps=cached.reencoded_kbps,
+        )
+        bot_stats.schedule_record(
+            track.provider, track.track_id, target.user_id or 0,
         )
         # Inline article → audio in-place via cached file_id. Carry the
         # re-encoded marker forward so cache hits look identical to the

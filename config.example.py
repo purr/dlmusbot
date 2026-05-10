@@ -53,6 +53,10 @@ MAX_FILE_MB: int = 50
 # repeat downloads return instantly via Telegram's CDN.
 CACHE_FILE: str = "data/cache.json"
 
+# JSON file backing /stats — one event per successful delivery, pruned to
+# the last 366 days so the rolling-year window stays accurate.
+STATS_FILE: str = "data/bot_stats.json"
+
 # Audio downloads use a per-job temporary directory created with
 # tempfile.TemporaryDirectory. Files are deleted immediately after upload.
 # Nothing persists on disk except the JSON cache above.
