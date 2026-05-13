@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from loguru import logger
 from pydantic import BaseModel, Field
 
 
@@ -52,7 +53,11 @@ class FileIdCache:
             return
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(
+                "file_id cache load failed at {} ({}): {} — starting empty",
+                self._path, type(e).__name__, e,
+            )
             raw = {}
         self._data = {
             k: CachedAudio.model_validate(v) for k, v in raw.items()

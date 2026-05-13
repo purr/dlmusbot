@@ -314,8 +314,8 @@ class SpotifyProvider(Provider):
             except (HandshakeError, LoginError, OSError):
                 try:
                     await sess.close()
-                except Exception:
-                    pass
+                except Exception as ce:
+                    log.error("error closing failed Spotify session (%s): %s", type(ce).__name__, ce)
                 raise
             self._session = sess
             return sess
@@ -405,7 +405,8 @@ class SpotifyProvider(Provider):
             for g in gid_list[:PLAYLIST_TRACK_LIMIT]:
                 try:
                     st = await api_mod.fetch_track_basic(s, g)
-                except SpotifyDownloaderError:
+                except SpotifyDownloaderError as e:
+                    log.error("album track hydration skipped for gid=%s (%s): %s", g, type(e).__name__, e)
                     continue
                 if st is not None:
                     sp_tracks.append(st)
@@ -434,7 +435,8 @@ class SpotifyProvider(Provider):
             for g in gid_list[:PLAYLIST_TRACK_LIMIT]:
                 try:
                     st = await api_mod.fetch_track_basic(s, g)
-                except SpotifyDownloaderError:
+                except SpotifyDownloaderError as e:
+                    log.error("artist top-track hydration skipped for gid=%s (%s): %s", g, type(e).__name__, e)
                     continue
                 if st is not None:
                     sp_tracks.append(st)
@@ -532,7 +534,8 @@ class SpotifyProvider(Provider):
                 gid = base62_to_gid(tid).hex()
                 try:
                     st = await api_mod.fetch_track_basic(s, gid)
-                except SpotifyDownloaderError:
+                except SpotifyDownloaderError as e:
+                    log.error("playlist track hydration skipped for tid=%s (%s): %s", tid, type(e).__name__, e)
                     continue
                 if st is None:
                     continue

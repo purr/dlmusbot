@@ -218,30 +218,38 @@ async def on_dm_text(
     # would just be a duplicate confirmation message).
     track_urls = sum(1 for u in urls if u.kind == "track")
     if track_urls > 1:
-        with contextlib.suppress(Exception):
+        try:
             await message.reply(PREPARING_TEXT, disable_notification=True)
+        except Exception as e:
+            logger.error("PREPARING_TEXT reply failed ({}): {}", type(e).__name__, e)
 
     for parsed in urls:
         try:
             await _enqueue_url(parsed, message, registry, job_runner, queue)
         except ProviderError as e:
-            logger.warning("dm enqueue failed [{}]: {}", parsed.url, e)
-            with contextlib.suppress(Exception):
+            logger.error("dm enqueue failed [{}] (ProviderError reason={}): {}", parsed.url, getattr(e, "reason", None), e)
+            try:
                 await message.reply(
                     "❌ <b>Couldn't grab that link</b>",
                     reply_markup=final_failed_kb(e.reason) if e.reason else failed_kb(parsed.provider, parsed.entity_id),
                 )
+            except Exception as re:
+                logger.error("dm failure-reply send failed [{}] ({}): {}", parsed.url, type(re).__name__, re)
         except DlmusError as e:
-            logger.warning("dm enqueue failed [{}]: {}", parsed.url, e)
-            with contextlib.suppress(Exception):
+            logger.error("dm enqueue failed [{}] ({}): {}", parsed.url, type(e).__name__, e)
+            try:
                 await message.reply(
                     "❌ <b>Couldn't grab that link</b>",
                     reply_markup=failed_kb(parsed.provider, parsed.entity_id),
                 )
+            except Exception as re:
+                logger.error("dm failure-reply send failed [{}] ({}): {}", parsed.url, type(re).__name__, re)
         except Exception:
-            logger.exception("dm enqueue failed [{}]", parsed.url)
-            with contextlib.suppress(Exception):
+            logger.exception("dm enqueue crashed [{}]", parsed.url)
+            try:
                 await message.reply(
                     "❌ <b>Something broke on my end</b>",
                     reply_markup=failed_kb(parsed.provider, parsed.entity_id),
                 )
+            except Exception as re:
+                logger.error("dm crash-reply send failed [{}] ({}): {}", parsed.url, type(re).__name__, re)

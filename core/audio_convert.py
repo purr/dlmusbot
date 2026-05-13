@@ -294,8 +294,8 @@ async def transcode_to_mp3(
     if delete_src:
         try:
             src.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            logger.error("failed to delete source after transcode {} ({}): {}", src, type(e).__name__, e)
 
     return dst
 
@@ -373,8 +373,8 @@ async def trim_long_edge_silence(
         if delete_src:
             try:
                 src.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.error("failed to delete source after edge-trim {} ({}): {}", src, type(e).__name__, e)
         return dst, removed
     except TranscodeError as e:
         # Timeout/ffmpeg issues are non-fatal. Keep original file and continue.

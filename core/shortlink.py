@@ -4,6 +4,7 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 import aiohttp
+from loguru import logger
 
 _SHORTLINK_DOMAINS = frozenset({
     "spoti.fi",
@@ -27,5 +28,6 @@ async def resolve(url: str) -> str:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as r:
                 return str(r.url)
-    except Exception:
+    except Exception as e:
+        logger.error("shortlink resolve failed for {} ({}): {}", url, type(e).__name__, e)
         return url

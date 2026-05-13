@@ -894,19 +894,29 @@ class JobRunner:
         if chat_id is None:
             return
         if target.status_message_id is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self._bot.edit_message_reply_markup(
                     chat_id=chat_id,
                     message_id=target.status_message_id,
                     reply_markup=kb,
                 )
                 return
-        with contextlib.suppress(Exception):
+            except Exception as e:
+                logger.error(
+                    "_mark_failed edit_message_reply_markup failed chat={} mid={} ({}): {}",
+                    chat_id, target.status_message_id, type(e).__name__, e,
+                )
+        try:
             await self._bot.send_message(
                 chat_id=chat_id,
                 text="❌ <b>Couldn't deliver that one</b>",
                 reply_to_message_id=target.reply_to_message_id,
                 reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(
+                "_mark_failed send_message failed chat={} ({}): {}",
+                chat_id, type(e).__name__, e,
             )
 
     async def _mark_dead(
@@ -927,19 +937,29 @@ class JobRunner:
         if chat_id is None:
             return
         if target.status_message_id is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self._bot.edit_message_reply_markup(
                     chat_id=chat_id,
                     message_id=target.status_message_id,
                     reply_markup=kb,
                 )
                 return
-        with contextlib.suppress(Exception):
+            except Exception as e:
+                logger.error(
+                    "_mark_dead edit_message_reply_markup failed chat={} mid={} reason={} ({}): {}",
+                    chat_id, target.status_message_id, reason, type(e).__name__, e,
+                )
+        try:
             await self._bot.send_message(
                 chat_id=chat_id,
                 text="❌ <b>Couldn't deliver that one</b>",
                 reply_to_message_id=target.reply_to_message_id,
                 reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(
+                "_mark_dead send_message failed chat={} reason={} ({}): {}",
+                chat_id, reason, type(e).__name__, e,
             )
 
     async def _mark_dm_blocked(
@@ -965,19 +985,29 @@ class JobRunner:
         if chat_id is None:
             return
         if target.status_message_id is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await self._bot.edit_message_reply_markup(
                     chat_id=chat_id,
                     message_id=target.status_message_id,
                     reply_markup=kb,
                 )
                 return
-        with contextlib.suppress(Exception):
+            except Exception as e:
+                logger.error(
+                    "_mark_dm_blocked edit_message_reply_markup failed chat={} mid={} ({}): {}",
+                    chat_id, target.status_message_id, type(e).__name__, e,
+                )
+        try:
             await self._bot.send_message(
                 chat_id=chat_id,
                 text="🔒 <b>I can't DM you yet</b> — open a chat with me first.",
                 reply_to_message_id=target.reply_to_message_id,
                 reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(
+                "_mark_dm_blocked send_message failed chat={} ({}): {}",
+                chat_id, type(e).__name__, e,
             )
 
 

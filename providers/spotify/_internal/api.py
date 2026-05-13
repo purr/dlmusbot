@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 import aiohttp
+from loguru import logger
 
 from . import protobuf as pb
 from .exceptions import StorageResolveError, TrackUnavailableError
@@ -238,7 +239,8 @@ def _collect_audio_files(buf: bytes, out: list[AudioFile], depth: int = 0) -> No
         return
     try:
         m = pb.decode(buf)
-    except Exception:
+    except Exception as e:
+        logger.error("protobuf decode failed in _collect_audio_files at depth {} ({}): {}", depth, type(e).__name__, e)
         return
     fid = m.get(1)
     fmt = m.get(2)
@@ -352,9 +354,11 @@ async def fetch_playback_files(
             params={"manifestFileFormat": manifest_format},
         ) as r:
             if r.status != 200:
+                logger.error("fetch_playback_files HTTP {} for track {}", r.status, track_id)
                 return None, []
             data = await r.json(content_type=None)
-    except aiohttp.ClientError:
+    except aiohttp.ClientError as e:
+        logger.error("fetch_playback_files network error for {} ({}): {}", track_id, type(e).__name__, e)
         return None, []
 
     files: list[AudioFile] = []
@@ -404,9 +408,11 @@ async def _resolve_linked_track_id(
             params={"manifestFileFormat": "file_ids_mp4"},
         ) as r:
             if r.status != 200:
+                logger.error("_resolve_linked_track_id HTTP {} for {}", r.status, track_id)
                 return None
             data = await r.json(content_type=None)
-    except aiohttp.ClientError:
+    except aiohttp.ClientError as e:
+        logger.error("_resolve_linked_track_id network error for {} ({}): {}", track_id, type(e).__name__, e)
         return None
     media = data.get("media") or {}
     for entry in media.values():
@@ -492,7 +498,11 @@ async def fetch_track(session: Session, gid_hex: str) -> Track:
                 session.http, session.access_token, track.spotify_id,
                 manifest_format="file_ids_flac",
             )
-        except Exception:
+        except Exception as e:
+            logger.error(
+                "fetch_track playback enrichment failed for {} ({}): {}",
+                track.spotify_id, type(e).__name__, e,
+            )
             playback_linked, extra = None, []
         if extra and (playback_linked is None or playback_linked == track.spotify_id):
             seen = {f.file_id_hex for f in track.files}

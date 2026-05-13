@@ -41,10 +41,12 @@ async def fetch_cover(http: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     try:
         async with http.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
             if r.status != 200:
+                logger.error("cover fetch HTTP {} for {}", r.status, url)
                 return None
             data = await r.read()
             return data if data else None
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.error("cover fetch failed for {} ({}): {}", url, type(e).__name__, e)
         return None
 
 
@@ -54,7 +56,8 @@ def _prepare_telegram_thumbnail_sync(cover: bytes) -> Optional[bytes]:
     try:
         img = Image.open(io.BytesIO(cover))
         img.load()
-    except Exception:
+    except Exception as e:
+        logger.error("thumbnail PIL decode failed ({}): {}", type(e).__name__, e)
         return None
 
     if img.mode not in ("RGB", "L"):

@@ -354,7 +354,8 @@ class SoundCloudProvider(Provider):
             try:
                 await self._api.transcoding_url(cand["url"])
                 return
-            except ProviderError:
+            except ProviderError as e:
+                log.error("sc preflight candidate skipped url=%s (%s): %s", cand.get("url"), type(e).__name__, e)
                 continue
         raise ProviderError(
             f"no playable transcodings for soundcloud track {track.track_id}",
@@ -522,7 +523,8 @@ class SoundCloudProvider(Provider):
                 stream_url = await self._api.transcoding_url(candidate["url"])
                 chosen = candidate
                 break
-            except ProviderError:
+            except ProviderError as e:
+                log.error("sc transcoding candidate skipped url=%s (%s): %s", candidate.get("url"), type(e).__name__, e)
                 continue
         if chosen is None or stream_url is None:
             raise ProviderError(
