@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
@@ -34,6 +35,29 @@ DEFAULT_HEADERS = {
 }
 
 log = logging.getLogger(__name__)
+
+
+def _normalize_resolve_url(url: str) -> str:
+    """Trim trailing slash(es) from the path before sending to /resolve.
+
+    SC's resolve endpoint is strict: `/bladee1000/` 404s while
+    `/bladee1000` returns the user object. Browser address bars often
+    append a trailing slash, and our SC URL pattern intentionally
+    captures any path char until `?`/`#`/whitespace, so the slash makes
+    it into the resolve call. Strip it here so every caller (inline,
+    dm, JobRunner) benefits.
+
+    Preserves query string + fragment, only touches the path."""
+    if not url:
+        return url
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return url
+    path = parts.path.rstrip("/")
+    if not path:
+        return url
+    return urlunparse(parts._replace(path=path))
 
 
 async def _probe_script_for_client_id(
@@ -134,8 +158,16 @@ class SoundCloudAPI:
             r.release()
 
     async def resolve(self, url: str) -> dict:
-        """Resolve any soundcloud URL to its JSON entity (track / set / user)."""
-        return await self._get_json(f"{API_V2}/resolve", params={"url": url})
+        """Resolve any soundcloud URL to its JSON entity (track / set / user).
+
+        Strips a trailing slash from the URL path before forwarding —
+        SC's resolve endpoint returns 404 for `/<slug>/` but accepts
+        `/<slug>`. The trailing slash is a legitimate user-typed form
+        (browser address bars often append one), so normalize here
+        rather than failing the lookup."""
+        return await self._get_json(
+            f"{API_V2}/resolve", params={"url": _normalize_resolve_url(url)},
+        )
 
     async def search_tracks(self, query: str, limit: int = 25) -> list[dict]:
         data = await self._get_json(

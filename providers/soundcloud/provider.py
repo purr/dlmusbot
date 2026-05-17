@@ -113,6 +113,14 @@ def _track_from_json(data: dict) -> Optional[Track]:
             "policy": data.get("policy"),
             "monetization_model": data.get("monetization_model"),
             "is_goplus": _is_goplus_json(data),
+            # `is_drm_only` flags tracks whose only real streams are
+            # CommonEncryption (FairPlay sample-AES / Widevine). SC keeps
+            # phantom legacy MP3 entries on those, but they 404 on resolve
+            # — so download() short-circuits with reason="drm" and the
+            # cross-provider fallback layer can try Spotify / YT Music.
+            "is_drm_only": _has_encrypted_only_transcodings(
+                (data.get("media") or {}).get("transcodings") or []
+            ),
         },
     )
 
@@ -133,6 +141,52 @@ def _is_goplus_json(data: dict) -> bool:
     if transcodings and all(bool(t.get("snipped")) for t in transcodings):
         return True
     return False
+
+
+# Protocol substrings SC uses for CommonEncryption variants. `cbcs` =
+# AES-CBC sample-AES (Apple FairPlay-style), `cenc`/`ctr` = AES-CTR
+# (Widevine / PlayReady). We can resolve the manifest, but the segments
+# are wrapped in a real DRM key system — no chance of decryption without
+# breaking DRM, so we treat any track whose only real variants are these
+# as `reason="drm"` and let the fallback layer try another provider.
+_ENCRYPTED_PROTO_HINTS = ("cbc", "cenc", "ctr", "encrypted")
+
+
+def _is_encrypted_protocol(proto: str) -> bool:
+    p = (proto or "").lower()
+    return any(h in p for h in _ENCRYPTED_PROTO_HINTS)
+
+
+def _has_encrypted_only_transcodings(transcodings: list[dict]) -> bool:
+    """True iff the track has real (non-snipped) encrypted variants and
+    no plain non-legacy variant we could fall back on.
+
+    SC keeps phantom legacy `progressive`/`hls` entries alongside the
+    real encrypted ones — those 404 when actually resolved, so we can't
+    rely on them. A track is DRM-locked-from-our-POV when:
+      * at least one real (non-snipped) variant uses encrypted HLS, AND
+      * no real non-legacy plain variant exists
+    Tracks with a plain non-legacy variant get the runtime to try it
+    first (defence-in-depth re-check in download()/preflight() catches
+    cases where SC mislabels the legacy flag)."""
+    if not transcodings:
+        return False
+    real = [t for t in transcodings if not t.get("snipped")]
+    if not real:
+        return False
+
+    def _proto(t: dict) -> str:
+        return (t.get("format") or {}).get("protocol") or ""
+
+    has_encrypted = any(_is_encrypted_protocol(_proto(t)) for t in real)
+    if not has_encrypted:
+        return False
+    has_plain_non_legacy = any(
+        not _is_encrypted_protocol(_proto(t))
+        and not t.get("is_legacy_transcoding")
+        for t in real
+    )
+    return not has_plain_non_legacy
 
 
 def _transcoding_rank(t: dict) -> tuple[int, int, int]:
@@ -298,7 +352,15 @@ class SoundCloudProvider(Provider):
     async def search(self, query: str, limit: int = 25) -> list[Track]:
         items = await self._api.search_tracks(query, limit=limit)
         tracks = [t for t in (_track_from_json(i) for i in items) if t]
-        return [t for t in tracks if not (t.extra or {}).get("is_goplus")]
+        # Filter both Go+ (snippet-only) and DRM-locked (CommonEncryption)
+        # so users never pick a hit we can't deliver. The cross-provider
+        # fallback in JobRunner still rescues URL-paste paths for those
+        # cases — this filter just keeps the inline picker clean.
+        return [
+            t for t in tracks
+            if not (t.extra or {}).get("is_goplus")
+            and not (t.extra or {}).get("is_drm_only")
+        ]
 
     async def get_track(self, entity_id: str) -> Track:
         if entity_id.isdigit():
@@ -315,6 +377,10 @@ class SoundCloudProvider(Provider):
         t = _track_from_json(data)
         if t is None:
             raise TrackNotFoundError(f"soundcloud {entity_id} not found")
+        # Don't pre-raise on `is_drm_only` here — the bot still needs the
+        # Track object to drive cross-provider fallback (artist + title +
+        # duration come from this exact metadata). download() / preflight
+        # are the gates that surface the `drm` reason.
         return t
 
     async def resolve_kind(self, entity_id: str) -> tuple[str, dict]:
@@ -335,6 +401,11 @@ class SoundCloudProvider(Provider):
             raise ProviderError(
                 f"soundcloud track {track.track_id} is Go+ (snippet only)",
                 reason="goplus",
+            )
+        if (track.extra or {}).get("is_drm_only") or _has_encrypted_only_transcodings(transcodings):
+            raise ProviderError(
+                f"soundcloud track {track.track_id} is DRM-protected (CommonEncryption)",
+                reason="drm",
             )
         candidates = _candidate_transcodings(
             transcodings,
@@ -357,6 +428,13 @@ class SoundCloudProvider(Provider):
             except ProviderError as e:
                 log.error("sc preflight candidate skipped url=%s (%s): %s", cand.get("url"), type(e).__name__, e)
                 continue
+        # All candidates 404'd. If the real variants are all encrypted,
+        # this is DRM — surface that so the fallback layer kicks in.
+        if _has_encrypted_only_transcodings(transcodings):
+            raise ProviderError(
+                f"soundcloud track {track.track_id} is DRM-protected (all decryptable transcodings 404'd)",
+                reason="drm",
+            )
         raise ProviderError(
             f"no playable transcodings for soundcloud track {track.track_id}",
             reason="unavailable",
@@ -499,6 +577,17 @@ class SoundCloudProvider(Provider):
                 reason="goplus",
             )
 
+        # DRM short-circuit: if every real variant rides an encrypted HLS
+        # protocol (cbcs / cenc — FairPlay-style sample-AES or Widevine),
+        # we have no chance of decrypting the segments. Surface as `drm`
+        # so the bot's cross-provider fallback can try Spotify / YT Music
+        # for the same artist + title instead of churning here.
+        if (track.extra or {}).get("is_drm_only") or _has_encrypted_only_transcodings(transcodings):
+            raise ProviderError(
+                f"soundcloud track {track.track_id} is DRM-protected (CommonEncryption)",
+                reason="drm",
+            )
+
         candidates = _candidate_transcodings(
             transcodings,
             allow_hls_fmp4=ffmpeg_available(),
@@ -527,6 +616,16 @@ class SoundCloudProvider(Provider):
                 log.error("sc transcoding candidate skipped url=%s (%s): %s", candidate.get("url"), type(e).__name__, e)
                 continue
         if chosen is None or stream_url is None:
+            # All plain candidates 404'd. If real variants are encrypted,
+            # this is DRM — caught above already, but defence-in-depth:
+            # phantom legacy MP3 entries that 404 alongside DRM-only real
+            # streams still hit this branch on tracks where the upfront
+            # detector wasn't triggered (e.g. mixed legacy + encrypted).
+            if _has_encrypted_only_transcodings(transcodings):
+                raise ProviderError(
+                    f"soundcloud track {track.track_id} is DRM-protected (all decryptable transcodings 404'd)",
+                    reason="drm",
+                )
             raise ProviderError(
                 f"no playable transcodings for soundcloud track {track.track_id}",
                 reason="unavailable",

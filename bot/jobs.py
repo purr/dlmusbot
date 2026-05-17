@@ -55,6 +55,11 @@ from core.exceptions import (
     FileTooLargeError,
     ProviderError,
 )
+from core.fallback import (
+    FALLBACK_REASONS,
+    MAX_FALLBACK_DEPTH,
+    find_alternative_track,
+)
 from core.models import DownloadResult, Track
 from providers.base import Provider
 from providers.registry import Registry
@@ -191,7 +196,12 @@ class JobRunner:
         provider: Provider,
         track: Track,
         target: DeliveryTarget,
+        *,
+        _tried_providers: Optional[set[str]] = None,
+        _tried_track_ids: Optional[set[str]] = None,
     ) -> None:
+        tried_providers = _tried_providers if _tried_providers is not None else {track.provider}
+        tried_track_ids = _tried_track_ids if _tried_track_ids is not None else {track.track_id}
         try:
             await self._do_run(provider, track, target)
         except DMNotOpenError as e:
@@ -202,16 +212,58 @@ class JobRunner:
             await self._mark_dm_blocked(target, track)
         except ProviderError as e:
             # When a provider tags the error with a permanent-failure
-            # reason (`e.reason`), retrying won't help (Go+ won't become
-            # free, region locks won't lift). Skip straight to the
-            # explanation popup. Otherwise treat as a transient failure
-            # and fall through to the standard retry kb.
-            if getattr(e, "reason", None):
+            # reason (`e.reason`), retrying the *same* provider won't
+            # help. For reasons that mean "this provider can't deliver
+            # but the song itself may exist elsewhere" (Go+ / DRM /
+            # region-lock), try the other registered providers via
+            # artist+title search before giving up. Otherwise: standard
+            # retry kb for transient ProviderErrors.
+            reason = getattr(e, "reason", None)
+            if reason in FALLBACK_REASONS:
+                if len(tried_track_ids) >= MAX_FALLBACK_DEPTH:
+                    logger.warning(
+                        "[{}:{}] fallback depth cap ({}) reached; marking dead ({})",
+                        track.provider, track.track_id,
+                        MAX_FALLBACK_DEPTH, reason,
+                    )
+                    await self._mark_dead(reason, target, track)
+                    return
+                logger.warning(
+                    "[{}:{}] permanent failure ({}); attempting cross-provider fallback",
+                    track.provider, track.track_id, reason,
+                )
+                fallback = await find_alternative_track(
+                    self._registry, track,
+                    tried=tried_providers,
+                    tried_track_ids=tried_track_ids,
+                )
+                if fallback is not None:
+                    fb_provider, fb_track = fallback
+                    tried_providers.add(fb_provider.name)
+                    tried_track_ids.add(fb_track.track_id)
+                    logger.info(
+                        "[{}:{}] falling back to {}:{} ({})",
+                        track.provider, track.track_id,
+                        fb_provider.name, fb_track.track_id,
+                        fb_track.display_title,
+                    )
+                    await self.run(
+                        fb_provider, fb_track, target,
+                        _tried_providers=tried_providers,
+                        _tried_track_ids=tried_track_ids,
+                    )
+                    return
+                logger.warning(
+                    "[{}:{}] no fallback found; marking dead ({})",
+                    track.provider, track.track_id, reason,
+                )
+                await self._mark_dead(reason, target, track)
+            elif reason:
                 logger.warning(
                     "[{}:{}] permanent failure ({}): {}",
-                    track.provider, track.track_id, e.reason, e,
+                    track.provider, track.track_id, reason, e,
                 )
-                await self._mark_dead(e.reason, target, track)
+                await self._mark_dead(reason, target, track)
             else:
                 logger.warning(
                     "job failed [{}:{}]: {}",
@@ -224,6 +276,7 @@ class JobRunner:
         except Exception:
             logger.exception("unhandled job failure [{}:{}]", track.provider, track.track_id)
             await self._mark_failed(target, track)
+
 
     # ------------------------------------------------------------------
 

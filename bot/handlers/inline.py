@@ -40,6 +40,7 @@ from loguru import logger
 
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError, TrackNotFoundError
+from core.fallback import FALLBACK_REASONS, find_alternative_track
 from core.fuzz import dedupe_tracks, rank_balanced
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
@@ -212,26 +213,43 @@ async def _build_results(
         try:
             t = await provider.get_track(track_id)
             if provider_name == "soundcloud":
-                from providers.soundcloud.provider import SoundCloudProvider  # noqa: SLF001
+                from providers.soundcloud.provider import (  # noqa: SLF001
+                    SoundCloudProvider,
+                )
+
                 if isinstance(provider, SoundCloudProvider):
-                    await provider.preflight_track(t)
+                    try:
+                        await provider.preflight_track(t)
+                    except ProviderError as pe:
+                        if pe.reason in FALLBACK_REASONS:
+                            alt = await find_alternative_track(registry, t)
+                            if alt is not None:
+                                return [alt[1]], "single", 1
+                        raise
         except ProviderError as e:
             if e.reason == "goplus":
                 return [], "goplus_blocked", 0
             if e.reason == "unavailable":
                 return [], "track_unavailable", 0
+            if e.reason == "drm":
+                return [], "drm_blocked", 0
             return [], "track_not_found", 0
         except TrackNotFoundError:
             return [], "track_not_found", 0
         except DlmusError as e:
             logger.debug(
                 "direct-id lookup failed [{}:{}]: {}: {}",
-                provider_name, track_id, type(e).__name__, e,
+                provider_name,
+                track_id,
+                type(e).__name__,
+                e,
             )
             return [], "track_not_found", 0
         except Exception:
             logger.exception(
-                "direct-id lookup crashed [%s:%s]", provider_name, track_id,
+                "direct-id lookup crashed [%s:%s]",
+                provider_name,
+                track_id,
             )
             return [], "track_not_found", 0
         return ([t] if t else []), "single", (1 if t else 0)
@@ -264,15 +282,27 @@ async def _build_results(
                     try:
                         t = await provider.get_track(parsed.entity_id)
                         if parsed.provider == "soundcloud":
-                            from providers.soundcloud.provider import SoundCloudProvider  # noqa: SLF001
+                            from providers.soundcloud.provider import (  # noqa: SLF001
+                                SoundCloudProvider,
+                            )
+
                             if isinstance(provider, SoundCloudProvider):
-                                await provider.preflight_track(t)
+                                try:
+                                    await provider.preflight_track(t)
+                                except ProviderError as pe:
+                                    if pe.reason in FALLBACK_REASONS:
+                                        alt = await find_alternative_track(registry, t)
+                                        if alt is not None:
+                                            return [alt[1]], "single", 1
+                                    raise
                         return [t], "single", 1
                     except ProviderError as e:
                         if e.reason == "goplus":
                             return [], "goplus_blocked", 0
                         if e.reason == "unavailable":
                             return [], "track_unavailable", 0
+                        if e.reason == "drm":
+                            return [], "drm_blocked", 0
                         raise
                 if parsed.kind == "album":
                     album = await provider.get_album(parsed.entity_id)
@@ -295,7 +325,8 @@ async def _build_results(
                         artist = await provider.get_artist(parsed.entity_id)
                     except Exception:
                         logger.exception(
-                            "artist resolve failed: {}", parsed.url,
+                            "artist resolve failed: {}",
+                            parsed.url,
                         )
                         return [], "artist_not_found", 0
                     if artist is None:
@@ -318,9 +349,25 @@ async def _build_results(
                         if kind == "track":
                             t = _track_from_json(data)
                             if t is not None and (t.extra or {}).get("is_goplus"):
+                                alt = await find_alternative_track(registry, t)
+                                if alt is not None:
+                                    return [alt[1]], "single", 1
                                 return [], "goplus_blocked", 0
                             if t is not None:
-                                await provider.preflight_track(t)
+                                try:
+                                    await provider.preflight_track(t)
+                                except ProviderError as pe:
+                                    if pe.reason in FALLBACK_REASONS:
+                                        alt = await find_alternative_track(registry, t)
+                                        if alt is not None:
+                                            return [alt[1]], "single", 1
+                                    if pe.reason == "goplus":
+                                        return [], "goplus_blocked", 0
+                                    if pe.reason == "drm":
+                                        return [], "drm_blocked", 0
+                                    if pe.reason == "unavailable":
+                                        return [], "track_unavailable", 0
+                                    raise
                             return ([t] if t else []), "single", (1 if t else 0)
                         if kind == "playlist":
                             # Delegate to the album/playlist resolver so
@@ -350,7 +397,8 @@ async def _build_results(
                         # SC URL resolved to something we can't handle.
                         logger.info(
                             "soundcloud URL resolved to unsupported kind={!r}: {}",
-                            kind, parsed.url,
+                            kind,
+                            parsed.url,
                         )
                         return [], "unsupported_url", 0
             except TrackNotFoundError:
@@ -363,14 +411,19 @@ async def _build_results(
                 # assuming the platform isn't wired up.
                 logger.warning(
                     "inline url fetch failed [{}:{}:{}]: {}: {}",
-                    parsed.provider, parsed.kind, parsed.entity_id,
-                    type(e).__name__, e,
+                    parsed.provider,
+                    parsed.kind,
+                    parsed.entity_id,
+                    type(e).__name__,
+                    e,
                 )
                 return [], "url_fetch_failed", 0
             except Exception:
                 logger.exception(
                     "inline url resolve crashed [{}:{}:{}]",
-                    parsed.provider, parsed.kind, parsed.entity_id,
+                    parsed.provider,
+                    parsed.kind,
+                    parsed.entity_id,
                 )
                 return [], "url_fetch_failed", 0
 
@@ -424,7 +477,9 @@ async def _safe_search(provider, query: str, limit: int) -> list[Track]:
 # ---- empty-query default -------------------------------------------------
 
 
-def _empty_query_results(bot_username: str, visible: frozenset[str]) -> list[InlineQueryResultArticle]:
+def _empty_query_results(
+    bot_username: str, visible: frozenset[str]
+) -> list[InlineQueryResultArticle]:
     """Placeholder when the query box is empty: same story as /start, inline slant."""
     return [
         InlineQueryResultArticle(
@@ -528,11 +583,13 @@ async def on_inline_query(
         # itself failed (token rotation, AP socket drop, region lock,
         # ...). Surface as a retry-friendly hint instead of pretending
         # the URL is unsupported.
-        switch_pm_text = "⚠️ Couldn't load that link — try again"
+        switch_pm_text = "⚠️ Couldn't load that link"
     elif mode == "track_not_found":
         switch_pm_text = "❌ Track ID not found"
     elif mode == "goplus_blocked":
-        switch_pm_text = "❌ SoundCloud Go+ track can't be downloaded"
+        switch_pm_text = "❌ Go+ tracks can't be downloaded"
+    elif mode == "drm_blocked":
+        switch_pm_text = "🔒 Can't download, its DRM protected"
     elif mode == "track_unavailable":
         switch_pm_text = "❌ Track unavailable for download"
     elif mode == "artist_not_found":

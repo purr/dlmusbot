@@ -61,6 +61,11 @@ STATUS_ALERTS: dict[str, str] = {
     "final_failed:unavailable": (
         "This track isn't playable in your region or has been removed."
     ),
+    "final_failed:drm": (
+        "This SoundCloud track is DRM-protected (encrypted streams) and "
+        "we couldn't find a free copy on Spotify or YouTube Music either. "
+        "Try a different upload of the same song."
+    ),
 }
 
 
