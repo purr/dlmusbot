@@ -131,6 +131,47 @@ PROVIDER_EMOJI = {
 # below that and ship whatever the fast ones returned.
 PROVIDER_SEARCH_TIMEOUT_S = 3.0
 
+# Inline fallback budget. find_alternative_track triggers a full
+# `provider.search()` round-trip per registered provider — when a
+# provider's auth handshake stalls (e.g. Spotify TOTP secrets endpoint
+# timing out at 30s), the inline_query response blows past Telegram's
+# ~10s window and the user sees nothing. Cap aggressively here so DRM
+# URLs always answer within budget, with or without a fallback hit.
+INLINE_FALLBACK_TIMEOUT_S = 5.0
+
+
+async def _inline_fallback(
+    registry: Registry, track: Track,
+) -> tuple[Optional[Track], bool]:
+    """Wrapper around `find_alternative_track` that enforces the inline
+    latency budget and swallows transient provider failures.
+
+    Returns `(track_or_none, timed_out)`:
+      * `(Track, False)`  — found an alt match
+      * `(None,  True)`   — fallback exceeded INLINE_FALLBACK_TIMEOUT_S
+                            (Spotify auth stall, etc.) — caller can
+                            distinguish "no match" from "couldn't ask"
+                            and show a try-again hint to the user
+      * `(None,  False)`  — fallback completed but found no match"""
+    try:
+        result = await asyncio.wait_for(
+            find_alternative_track(registry, track),
+            timeout=INLINE_FALLBACK_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "inline fallback timed out after {:.1f}s for [{}:{}]",
+            INLINE_FALLBACK_TIMEOUT_S, track.provider, track.track_id,
+        )
+        return None, True
+    except Exception:
+        logger.exception(
+            "inline fallback crashed for [{}:{}]",
+            track.provider, track.track_id,
+        )
+        return None, False
+    return (result[1] if result is not None else None), False
+
 
 def _result_id(t: Track, idx: int = 0) -> str:
     rid = f"{t.provider}:{t.track_id}"
@@ -222,9 +263,11 @@ async def _build_results(
                         await provider.preflight_track(t)
                     except ProviderError as pe:
                         if pe.reason in FALLBACK_REASONS:
-                            alt = await find_alternative_track(registry, t)
+                            alt, timed_out = await _inline_fallback(registry, t)
                             if alt is not None:
-                                return [alt[1]], "single", 1
+                                return [alt], "single", 1
+                            if timed_out and pe.reason == "drm":
+                                return [], "drm_fallback_timeout", 0
                         raise
         except ProviderError as e:
             if e.reason == "goplus":
@@ -291,9 +334,11 @@ async def _build_results(
                                     await provider.preflight_track(t)
                                 except ProviderError as pe:
                                     if pe.reason in FALLBACK_REASONS:
-                                        alt = await find_alternative_track(registry, t)
+                                        alt, timed_out = await _inline_fallback(registry, t)
                                         if alt is not None:
-                                            return [alt[1]], "single", 1
+                                            return [alt], "single", 1
+                                        if timed_out and pe.reason == "drm":
+                                            return [], "drm_fallback_timeout", 0
                                     raise
                         return [t], "single", 1
                     except ProviderError as e:
@@ -349,18 +394,20 @@ async def _build_results(
                         if kind == "track":
                             t = _track_from_json(data)
                             if t is not None and (t.extra or {}).get("is_goplus"):
-                                alt = await find_alternative_track(registry, t)
+                                alt, _timed_out = await _inline_fallback(registry, t)
                                 if alt is not None:
-                                    return [alt[1]], "single", 1
+                                    return [alt], "single", 1
                                 return [], "goplus_blocked", 0
                             if t is not None:
                                 try:
                                     await provider.preflight_track(t)
                                 except ProviderError as pe:
                                     if pe.reason in FALLBACK_REASONS:
-                                        alt = await find_alternative_track(registry, t)
+                                        alt, timed_out = await _inline_fallback(registry, t)
                                         if alt is not None:
-                                            return [alt[1]], "single", 1
+                                            return [alt], "single", 1
+                                        if timed_out and pe.reason == "drm":
+                                            return [], "drm_fallback_timeout", 0
                                     if pe.reason == "goplus":
                                         return [], "goplus_blocked", 0
                                     if pe.reason == "drm":
@@ -590,6 +637,8 @@ async def on_inline_query(
         switch_pm_text = "❌ Go+ tracks can't be downloaded"
     elif mode == "drm_blocked":
         switch_pm_text = "🔒 Can't download, its DRM protected"
+    elif mode == "drm_fallback_timeout":
+        switch_pm_text = "🔒 DRM track — Spotify slow, try again"
     elif mode == "track_unavailable":
         switch_pm_text = "❌ Track unavailable for download"
     elif mode == "artist_not_found":
