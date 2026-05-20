@@ -17,15 +17,15 @@ def track_one_line(t: Track) -> str:
     return f"{t.artists_str} — {t.title} ({t.duration_str})"
 
 
+_PLATFORM_LABELS = {
+    "spotify": "Spotify",
+    "soundcloud": "SoundCloud",
+    "youtube_music": "YouTube Music",
+}
+
+
 def _platform_label(track: Track) -> str:
-    provider = (track.provider or "").strip().lower()
-    if provider == "spotify":
-        return "Spotify"
-    if provider == "soundcloud":
-        return "SoundCloud"
-    if provider == "youtube_music":
-        return "YouTube Music"
-    return "Link"
+    return _PLATFORM_LABELS.get((track.provider or "").strip().lower(), "Link")
 
 
 # ---- The purr caption ----------------------------------------------------
@@ -52,6 +52,22 @@ def format_track_caption(
     if bot_username:
         parts.append(f"♬ @{esc(bot_username)}")
     return " ".join(parts) or esc(track_one_line(track))
+
+
+def format_url_caption(
+    url: str, bot_username: str, provider: str = "",
+) -> str:
+    """Stable message body for failures where no track metadata could be
+    fetched. Same shape as `format_track_caption` (link + ♬ @bot) so a
+    failed reply looks identical to every other message in the chat — only
+    its button differs. Built from just the URL the user sent."""
+    label = _PLATFORM_LABELS.get((provider or "").strip().lower(), "Link")
+    parts: list[str] = []
+    if url:
+        parts.append(f"𝄞 <a href='{esc(url)}'>{label}</a>")
+    if bot_username:
+        parts.append(f"♬ @{esc(bot_username)}")
+    return " ".join(parts) or esc(url)
 
 
 # ---- Generic placeholder shown when no track-info known yet -------------

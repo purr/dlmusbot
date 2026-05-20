@@ -35,7 +35,7 @@ Key settings:
 - `SP_DC` (required for Spotify)
 - `YT_COOKIES_FILE` (optional; recommended path: `data/cookies.youtube.txt`)
 - `FORWARD_LOG_CHANNEL_ID` (optional forwarding log channel)
-- `DOWNLOAD_CONCURRENCY`
+- `DOWNLOAD_CONCURRENCY` (optional; 0 = auto, one worker per CPU core)
 - `MAX_FILE_MB`
 - `INLINE_RESULTS`
 - `SEARCH_PER_PROVIDER`

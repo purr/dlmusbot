@@ -2,14 +2,14 @@
 
 Jobs are opaque async callables — the bot layer enqueues `lambda: process(...)`
 and awaits their completion via the returned `asyncio.Future`. Workers pull
-strict-FIFO; concurrency cap is set in config.
+strict-FIFO; the worker count is fixed at construction.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Generic, Optional, TypeVar
+from typing import Awaitable, Callable, Generic, TypeVar
 
 T = TypeVar("T")
 log = logging.getLogger(__name__)
@@ -23,6 +23,13 @@ class DownloadQueue(Generic[T]):
         self._queue: asyncio.Queue[
             tuple[Callable[[], Awaitable[T]], asyncio.Future[T]]
         ] = asyncio.Queue()
+        # Futures still waiting for a free worker, in strict FIFO order.
+        # A job is appended on submit and removed when a worker pulls it
+        # off the queue. `position()` indexes into this list.
+        self._pending: list[asyncio.Future[T]] = []
+        # Fires whenever `_pending` changes (job submitted or pulled), so
+        # position trackers refresh exactly on change instead of polling.
+        self._change: asyncio.Event = asyncio.Event()
         self._workers: list[asyncio.Task] = []
         self._running = False
 
@@ -48,11 +55,45 @@ class DownloadQueue(Generic[T]):
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[T] = loop.create_future()
         self._queue.put_nowait((job, fut))
+        self._pending.append(fut)
+        self._signal_change()
         return fut
+
+    def _signal_change(self) -> None:
+        """Wake everything waiting on a queue change, then install a fresh
+        event so the next waiter starts clean."""
+        old, self._change = self._change, asyncio.Event()
+        old.set()
+
+    @property
+    def change_event(self) -> asyncio.Event:
+        """The current change-event. Snapshot this *before* reading queue
+        state; awaiting it then catches any change that lands afterwards
+        (the event is already set if a change raced in between)."""
+        return self._change
+
+    @property
+    def concurrency(self) -> int:
+        """Number of worker slots — the most jobs that can run at once."""
+        return self._concurrency
 
     @property
     def pending(self) -> int:
-        return self._queue.qsize()
+        """Number of jobs still waiting for a worker (not yet running).
+
+        A job cancelled while mid-queue keeps its slot until a worker
+        drains up to it, so this can briefly over-count by the number of
+        such cancelled jobs. Fine for the cosmetic position label."""
+        return len(self._pending)
+
+    def position(self, fut: asyncio.Future[T]) -> int:
+        """0-based index of `fut` among the jobs still waiting for a
+        worker. Returns -1 once the job has been picked up (or if it was
+        never queued here)."""
+        try:
+            return self._pending.index(fut)
+        except ValueError:
+            return -1
 
     async def _worker(self, idx: int) -> None:
         while self._running:
@@ -60,6 +101,11 @@ class DownloadQueue(Generic[T]):
                 job, fut = await self._queue.get()
             except asyncio.CancelledError:
                 return
+            try:
+                self._pending.remove(fut)
+            except ValueError:
+                pass
+            self._signal_change()
             if fut.cancelled():
                 self._queue.task_done()
                 continue

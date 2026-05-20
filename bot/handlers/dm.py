@@ -10,18 +10,17 @@ Then the job runner sends the audio with the same caption + final buttons
 
 from __future__ import annotations
 
-import contextlib
-
 from aiogram import F, Router
 from aiogram.enums import ChatType
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from loguru import logger
 
-from core.exceptions import DlmusError, ProviderError, TrackNotFoundError, UnsupportedURLError
+from core.exceptions import (
+    DlmusError,
+    ProviderError,
+    TrackNotFoundError,
+    UnsupportedURLError,
+)
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
 from core.url_parser import ParsedURL, parse_all
@@ -29,10 +28,8 @@ from providers.registry import Registry
 
 from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
-from ..status import failed_kb, placeholder_kb
-from ..status import final_failed_kb
-from ..ui import PREPARING_TEXT
-
+from ..status import failed_kb, final_failed_kb, placeholder_kb
+from ..ui import PREPARING_TEXT, format_url_caption
 
 # Pretty labels for the album/playlist DM-rejection notice.
 _KIND_LABEL = {
@@ -42,7 +39,9 @@ _KIND_LABEL = {
 
 
 async def _reject_collection(
-    message: Message, parsed: ParsedURL, kind_label: str = "album",
+    message: Message,
+    parsed: ParsedURL,
+    kind_label: str = "album",
 ) -> None:
     """DMs only deliver single tracks — albums / playlists would hammer the
     download queue with dozens of jobs at once. Politely refuse with a
@@ -54,22 +53,30 @@ async def _reject_collection(
         f"{emoji} <b>{plural.capitalize()} aren't supported in DM.</b>\n"
         f"Tap below to open the {kind_label} inline and pick the tracks "
         f"you want.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"🔍 Open {kind_label} inline",
-                switch_inline_query_current_chat=parsed.url,
-            ),
-        ]]),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"🔍 Open {kind_label} inline",
+                        switch_inline_query_current_chat=parsed.url,
+                    ),
+                ]
+            ]
+        ),
         disable_notification=True,
         disable_web_page_preview=True,
     )
+
 
 router = Router(name="dm")
 
 
 async def _post_placeholder(
-    message: Message, track: Track, job_runner: JobRunner,
-    *, original_spotify_url: str | None = None,
+    message: Message,
+    track: Track,
+    job_runner: JobRunner,
+    *,
+    original_spotify_url: str | None = None,
 ) -> int:
     """Send the placeholder reply: full caption + Source/Artist/Downloading
     buttons. Returns the message_id we'll later delete."""
@@ -83,13 +90,19 @@ async def _post_placeholder(
 
 
 async def _enqueue_track(
-    provider, track: Track, message: Message,
-    job_runner: JobRunner, queue,
-    *, original_spotify_url: str | None = None,
+    provider,
+    track: Track,
+    message: Message,
+    job_runner: JobRunner,
+    queue,
+    *,
+    original_spotify_url: str | None = None,
     request_query: str | None = None,
 ) -> None:
     status_id = await _post_placeholder(
-        message, track, job_runner,
+        message,
+        track,
+        job_runner,
         original_spotify_url=original_spotify_url,
     )
     target = DeliveryTarget(
@@ -101,7 +114,7 @@ async def _enqueue_track(
         request_query=request_query,
         request_source="dm_link",
     )
-    queue.submit(lambda: job_runner.run(provider, track, target))
+    job_runner.enqueue(queue, provider, track, target)
 
 
 async def _enqueue_url(
@@ -113,7 +126,9 @@ async def _enqueue_url(
 ) -> None:
     logger.info(
         "url received: provider={} kind={} id={} from user={}",
-        parsed.provider, parsed.kind, parsed.entity_id,
+        parsed.provider,
+        parsed.kind,
+        parsed.entity_id,
         message.from_user.id if message.from_user else "?",
     )
     provider = registry.get(parsed.provider)
@@ -132,11 +147,17 @@ async def _enqueue_url(
         track = await provider.get_track(parsed.entity_id)
         logger.info(
             "track resolved: [{}:{}] {} ({})",
-            parsed.provider, parsed.entity_id,
-            track.display_title, track.duration_str,
+            parsed.provider,
+            parsed.entity_id,
+            track.display_title,
+            track.duration_str,
         )
         await _enqueue_track(
-            provider, track, message, job_runner, queue,
+            provider,
+            track,
+            message,
+            job_runner,
+            queue,
             request_query=parsed.url,
         )
         return
@@ -159,7 +180,11 @@ async def _enqueue_url(
             )
 
     if parsed.kind == "url" and parsed.provider == "soundcloud":
-        from providers.soundcloud.provider import SoundCloudProvider, _track_from_json  # noqa: SLF001
+        from providers.soundcloud.provider import (  # noqa: SLF001
+            SoundCloudProvider,
+            _track_from_json,
+        )
+
         if not isinstance(provider, SoundCloudProvider):
             raise UnsupportedURLError("expected SoundCloudProvider")
         kind, data = await provider.resolve_kind(parsed.entity_id)
@@ -169,12 +194,17 @@ async def _enqueue_url(
                 raise TrackNotFoundError("could not parse SoundCloud track")
             if (t.extra or {}).get("is_goplus"):
                 await message.reply(
-                    "❌ <b>Couldn't grab that link</b>",
+                    job_runner.caption(t),
                     reply_markup=final_failed_kb("goplus"),
+                    disable_web_page_preview=True,
                 )
                 return
             await _enqueue_track(
-                provider, t, message, job_runner, queue,
+                provider,
+                t,
+                message,
+                job_runner,
+                queue,
                 request_query=parsed.url,
             )
             return
@@ -227,29 +257,56 @@ async def on_dm_text(
         try:
             await _enqueue_url(parsed, message, registry, job_runner, queue)
         except ProviderError as e:
-            logger.error("dm enqueue failed [{}] (ProviderError reason={}): {}", parsed.url, getattr(e, "reason", None), e)
+            logger.error(
+                "dm enqueue failed [{}] (ProviderError reason={}): {}",
+                parsed.url,
+                getattr(e, "reason", None),
+                e,
+            )
             try:
                 await message.reply(
-                    "❌ <b>Couldn't grab that link</b>",
-                    reply_markup=final_failed_kb(e.reason) if e.reason else failed_kb(parsed.provider, parsed.entity_id),
+                    format_url_caption(parsed.url, bot_username, parsed.provider),
+                    reply_markup=final_failed_kb(e.reason)
+                    if e.reason
+                    else failed_kb(parsed.provider, parsed.entity_id),
+                    disable_web_page_preview=True,
                 )
             except Exception as re:
-                logger.error("dm failure-reply send failed [{}] ({}): {}", parsed.url, type(re).__name__, re)
+                logger.error(
+                    "dm failure-reply send failed [{}] ({}): {}",
+                    parsed.url,
+                    type(re).__name__,
+                    re,
+                )
         except DlmusError as e:
-            logger.error("dm enqueue failed [{}] ({}): {}", parsed.url, type(e).__name__, e)
+            logger.error(
+                "dm enqueue failed [{}] ({}): {}", parsed.url, type(e).__name__, e
+            )
             try:
                 await message.reply(
-                    "❌ <b>Couldn't grab that link</b>",
+                    format_url_caption(parsed.url, bot_username, parsed.provider),
                     reply_markup=failed_kb(parsed.provider, parsed.entity_id),
+                    disable_web_page_preview=True,
                 )
             except Exception as re:
-                logger.error("dm failure-reply send failed [{}] ({}): {}", parsed.url, type(re).__name__, re)
+                logger.error(
+                    "dm failure-reply send failed [{}] ({}): {}",
+                    parsed.url,
+                    type(re).__name__,
+                    re,
+                )
         except Exception:
             logger.exception("dm enqueue crashed [{}]", parsed.url)
             try:
                 await message.reply(
-                    "❌ <b>Something broke on my end</b>",
+                    format_url_caption(parsed.url, bot_username, parsed.provider),
                     reply_markup=failed_kb(parsed.provider, parsed.entity_id),
+                    disable_web_page_preview=True,
                 )
             except Exception as re:
-                logger.error("dm crash-reply send failed [{}] ({}): {}", parsed.url, type(re).__name__, re)
+                logger.error(
+                    "dm crash-reply send failed [{}] ({}): {}",
+                    parsed.url,
+                    type(re).__name__,
+                    re,
+                )

@@ -40,9 +40,9 @@ YT_COOKIES_FILE: str = ""
 
 # --- Download / queue ------------------------------------------------------
 
-# Concurrent downloads through the global pool. Higher = faster bursts but
-# more memory. 3 is a good default for Telegram bots.
-DOWNLOAD_CONCURRENCY: int = 3
+# Concurrent downloads. 0 = automatic (one worker per CPU core). Set a
+# positive number to override and pin the pool regardless of host.
+DOWNLOAD_CONCURRENCY: int = 0
 
 # Hard cap on output file size in MB. Telegram bot limit is 50 MB without
 # Premium, 2000 MB with. Files above this are rejected with a friendly note.

@@ -121,7 +121,7 @@ async def on_download(
         await cb.answer("Couldn't fetch that one. Try again?")
         return
 
-    queue.submit(lambda: job_runner.run(provider, track, target))
+    job_runner.enqueue(queue, provider, track, target)
     await cb.answer("Download started! The track will appear shortly.")
 
 

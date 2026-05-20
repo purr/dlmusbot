@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re as _re_mod
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,28 +40,20 @@ from aiogram.types import (
 )
 from loguru import logger
 
+from core import stats as bot_stats
 from core.audio_convert import (
     MIN_LISTENABLE_KBPS,
     estimate_size_mb,
     probe_bitrate_kbps,
     target_bitrate_for_size,
-    trim_long_edge_silence,
     transcode_to_mp3,
+    trim_long_edge_silence,
 )
-from core import stats as bot_stats
 from core.cache import CachedAudio, FileIdCache
-from core.exceptions import (
-    DlmusError,
-    DMNotOpenError,
-    FileTooLargeError,
-    ProviderError,
-)
-from core.fallback import (
-    FALLBACK_REASONS,
-    MAX_FALLBACK_DEPTH,
-    find_alternative_track,
-)
+from core.exceptions import DlmusError, DMNotOpenError, FileTooLargeError, ProviderError
+from core.fallback import FALLBACK_REASONS, MAX_FALLBACK_DEPTH, find_alternative_track
 from core.models import DownloadResult, Track
+from core.queue import DownloadQueue
 from providers.base import Provider
 from providers.registry import Registry
 
@@ -70,15 +63,14 @@ from .status import (
     failed_kb,
     final_failed_kb,
     inline_audio_kb,
+    inline_queue_kb,
     inline_stage_kb,
     permission_required_kb,
+    queue_kb,
     stage_kb,
 )
 from .tagging import embed_metadata, fetch_cover, prepare_telegram_thumbnail
 from .ui import format_track_caption
-
-
-import re as _re_mod
 
 _KBPS_IN_FORMAT = _re_mod.compile(r"(\d{2,4})")
 
@@ -126,10 +118,15 @@ class DeliveryTarget:
     `status_message_id` is the chat-mode placeholder (full track-info text +
     buttons + Downloading…); we delete it after the audio lands.
     `inline_message_id` is for inline mode — only its reply_markup edits."""
+
     chat_id: Optional[int] = None
     reply_to_message_id: Optional[int] = None
     inline_message_id: Optional[str] = None
     status_message_id: Optional[int] = None
+    # Background queue-position tracker for this job, if one was spawned.
+    # The worker cancels it (`_stop_queue_tracker`) before editing the
+    # message itself, so a stale "In queue" edit can't outlive the wait.
+    queue_task: Optional[asyncio.Task] = None
     user_id: Optional[int] = None
     original_spotify_url: Optional[str] = None
     request_query: Optional[str] = None
@@ -153,13 +150,19 @@ class JobRunner:
         self._max_file_mb = max_file_mb
         self._bot_username = bot_username
         self._dm_probe = dm_probe
-        self._forward_log_channel_id = self._normalize_channel_id(forward_log_channel_id)
+        self._forward_log_channel_id = self._normalize_channel_id(
+            forward_log_channel_id
+        )
         self._http: Optional[aiohttp.ClientSession] = None
         # Inline-mode retry counter. Key = inline_message_id, value =
         # consecutive failure count. Bumped on _mark_failed, cleared on a
         # successful delivery. Once it reaches MAX_INLINE_RETRIES we swap
         # in `final_failed_kb` so the user knows further clicks won't help.
         self._inline_failures: dict[str, int] = {}
+        # Strong refs to in-flight queue-position tracker tasks so the
+        # event loop doesn't GC them mid-run. Each task discards itself
+        # from this set on completion.
+        self._queue_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _normalize_channel_id(channel_id: Optional[str]) -> Optional[str]:
@@ -177,6 +180,10 @@ class JobRunner:
             self._http = aiohttp.ClientSession()
 
     async def close(self) -> None:
+        for task in list(self._queue_tasks):
+            task.cancel()
+        if self._queue_tasks:
+            await asyncio.gather(*self._queue_tasks, return_exceptions=True)
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -187,9 +194,103 @@ class JobRunner:
 
     def caption(self, track: Track, original_spotify_url: Optional[str] = None) -> str:
         return format_track_caption(
-            track, self._bot_username,
+            track,
+            self._bot_username,
             original_spotify_url=original_spotify_url,
         )
+
+    def enqueue(
+        self,
+        queue: DownloadQueue,
+        provider: Provider,
+        track: Track,
+        target: DeliveryTarget,
+    ) -> None:
+        """Submit a download job. When the queue is backed up deeper than
+        the worker pool (so the job can't start right away), also spawn a
+        background task that keeps the placeholder's status button showing
+        the job's live queue position until a worker picks it up."""
+        fut = queue.submit(lambda: self.run(provider, track, target))
+        if queue.pending > queue.concurrency:
+            task = asyncio.create_task(
+                self._track_queue_position(queue, fut, track, target)
+            )
+            target.queue_task = task
+            self._queue_tasks.add(task)
+            task.add_done_callback(self._queue_tasks.discard)
+
+    async def _track_queue_position(
+        self,
+        queue: DownloadQueue,
+        fut: asyncio.Future,
+        track: Track,
+        target: DeliveryTarget,
+    ) -> None:
+        """While `fut` waits in a queue deeper than the worker pool,
+        refresh the placeholder button with its position — driven by the
+        queue's change-event, so it updates the instant the queue moves,
+        not on a timer. The worker stops this task (`_stop_queue_tracker`)
+        and waits for any in-flight edit to finish before it touches the
+        same message, so position edits land before the stage edits.
+        Self-exits early once the job reaches the front, or the queue
+        drains down to the worker count — reverting the button to the
+        plain "Downloading..." label."""
+        last_shown: Optional[tuple[int, int]] = None
+        try:
+            while True:
+                # Snapshot the change-event before reading queue state, so
+                # a dequeue racing in right after is still caught.
+                changed = queue.change_event
+                pos = queue.position(fut)
+                if pos < 0:
+                    return  # picked up by a worker
+                total = queue.pending
+                if pos >= 1 and total > queue.concurrency:
+                    shown = (pos + 1, total)
+                    if shown != last_shown:
+                        await self._set_queue_kb(
+                            target,
+                            track,
+                            pos + 1,
+                            total,
+                        )
+                        last_shown = shown
+                else:
+                    # At the front, or the queue is no deeper than the
+                    # worker pool — hand the button back to the normal
+                    # "Downloading..." label and stop tracking.
+                    await self._set_stage_kb(target, track, "downloading")
+                    return
+                # Wait until the queue actually changes — no fixed poll.
+                await changed.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[{}:{}] queue-position tracker stopped on error: {}",
+                track.provider,
+                track.track_id,
+                e,
+            )
+
+    async def _stop_queue_tracker(self, target: DeliveryTarget) -> None:
+        """Stop this job's queue-position tracker before the download
+        starts editing the same message. The job has already left the
+        queue, so the tracker sees `position == -1` and exits on its own —
+        we wait for that so any in-flight position edit finishes first and
+        the worker's stage edits land strictly after it. A tracker wedged
+        in a flood-throttled edit is force-cancelled after a short grace
+        period rather than pinning the worker."""
+        task = target.queue_task
+        if task is None:
+            return
+        target.queue_task = None
+        try:
+            await asyncio.wait_for(task, timeout=5.0)
+        except asyncio.TimeoutError:
+            pass  # wait_for already cancelled the wedged task
+        except asyncio.CancelledError:
+            pass
 
     async def run(
         self,
@@ -200,14 +301,20 @@ class JobRunner:
         _tried_providers: Optional[set[str]] = None,
         _tried_track_ids: Optional[set[str]] = None,
     ) -> None:
-        tried_providers = _tried_providers if _tried_providers is not None else {track.provider}
-        tried_track_ids = _tried_track_ids if _tried_track_ids is not None else {track.track_id}
+        tried_providers = (
+            _tried_providers if _tried_providers is not None else {track.provider}
+        )
+        tried_track_ids = (
+            _tried_track_ids if _tried_track_ids is not None else {track.track_id}
+        )
         try:
             await self._do_run(provider, track, target)
         except DMNotOpenError as e:
             logger.warning(
                 "[{}:{}] DM closed at delivery time: {}",
-                track.provider, track.track_id, e,
+                track.provider,
+                track.track_id,
+                e,
             )
             await self._mark_dm_blocked(target, track)
         except ProviderError as e:
@@ -223,17 +330,22 @@ class JobRunner:
                 if len(tried_track_ids) >= MAX_FALLBACK_DEPTH:
                     logger.warning(
                         "[{}:{}] fallback depth cap ({}) reached; marking dead ({})",
-                        track.provider, track.track_id,
-                        MAX_FALLBACK_DEPTH, reason,
+                        track.provider,
+                        track.track_id,
+                        MAX_FALLBACK_DEPTH,
+                        reason,
                     )
                     await self._mark_dead(reason, target, track)
                     return
                 logger.warning(
                     "[{}:{}] permanent failure ({}); attempting cross-provider fallback",
-                    track.provider, track.track_id, reason,
+                    track.provider,
+                    track.track_id,
+                    reason,
                 )
                 fallback = await find_alternative_track(
-                    self._registry, track,
+                    self._registry,
+                    track,
                     tried=tried_providers,
                     tried_track_ids=tried_track_ids,
                 )
@@ -243,46 +355,62 @@ class JobRunner:
                     tried_track_ids.add(fb_track.track_id)
                     logger.info(
                         "[{}:{}] falling back to {}:{} ({})",
-                        track.provider, track.track_id,
-                        fb_provider.name, fb_track.track_id,
+                        track.provider,
+                        track.track_id,
+                        fb_provider.name,
+                        fb_track.track_id,
                         fb_track.display_title,
                     )
                     await self.run(
-                        fb_provider, fb_track, target,
+                        fb_provider,
+                        fb_track,
+                        target,
                         _tried_providers=tried_providers,
                         _tried_track_ids=tried_track_ids,
                     )
                     return
                 logger.warning(
                     "[{}:{}] no fallback found; marking dead ({})",
-                    track.provider, track.track_id, reason,
+                    track.provider,
+                    track.track_id,
+                    reason,
                 )
                 await self._mark_dead(reason, target, track)
             elif reason:
                 logger.warning(
                     "[{}:{}] permanent failure ({}): {}",
-                    track.provider, track.track_id, reason, e,
+                    track.provider,
+                    track.track_id,
+                    reason,
+                    e,
                 )
                 await self._mark_dead(reason, target, track)
             else:
                 logger.warning(
                     "job failed [{}:{}]: {}",
-                    track.provider, track.track_id, e,
+                    track.provider,
+                    track.track_id,
+                    e,
                 )
                 await self._mark_failed(target, track)
         except (FileTooLargeError, DlmusError) as e:
             logger.warning("job failed [{}:{}]: {}", track.provider, track.track_id, e)
             await self._mark_failed(target, track)
         except Exception:
-            logger.exception("unhandled job failure [{}:{}]", track.provider, track.track_id)
+            logger.exception(
+                "unhandled job failure [{}:{}]", track.provider, track.track_id
+            )
             await self._mark_failed(target, track)
-
 
     # ------------------------------------------------------------------
 
     async def _do_run(
         self, provider: Provider, track: Track, target: DeliveryTarget
     ) -> None:
+        # A worker is now running this job — kill the queue-position
+        # tracker (if any) and wait for it to stop before any stage edit,
+        # so a stale "In queue" button can't outlive the wait.
+        await self._stop_queue_tracker(target)
         tag = f"{track.provider}:{track.track_id}"
         logger.info(
             "<cyan>[job]</cyan> <magenta>{}</magenta> source={} user={} query={!r}",
@@ -306,21 +434,27 @@ class JobRunner:
         # download if needed (see fit-to-cap block below).
         if track.duration_seconds > 0:
             min_possible_mb = estimate_size_mb(
-                track.duration_seconds, MIN_LISTENABLE_KBPS,
+                track.duration_seconds,
+                MIN_LISTENABLE_KBPS,
             )
             if min_possible_mb > self._max_file_mb:
                 logger.warning(
                     "[{}] track {} is {} long — even at {} kbps would be "
                     "{:.1f} MB, exceeds {} MB cap; failing fast",
-                    tag, track.track_id, track.duration_str,
-                    MIN_LISTENABLE_KBPS, min_possible_mb, self._max_file_mb,
+                    tag,
+                    track.track_id,
+                    track.duration_str,
+                    MIN_LISTENABLE_KBPS,
+                    min_possible_mb,
+                    self._max_file_mb,
                 )
                 await self._mark_dead("too_long", target, track)
                 return
 
         logger.info(
             "[{}] queued for download: {}",
-            tag, track.display_title,
+            tag,
+            track.display_title,
         )
         # Per-target stage setter — keeps the placeholder caption stable
         # and just edits the status button between Downloading → Decrypting
@@ -333,31 +467,17 @@ class JobRunner:
             if stage == last_stage["v"]:
                 return
             last_stage["v"] = stage
-            try:
-                if target.inline_message_id:
-                    # Inline messages get the bare status button only —
-                    # no Source/Artist row. Final delivery clears the kb.
-                    await self._set_inline_kb(target, inline_stage_kb(stage))
-                elif target.status_message_id is not None:
-                    chat_id = target.chat_id or target.user_id
-                    if chat_id is not None:
-                        # Chat-mode placeholder keeps the full row
-                        # ([Source · Artist] above the status button).
-                        await self._bot.edit_message_reply_markup(
-                            chat_id=chat_id,
-                            message_id=target.status_message_id,
-                            reply_markup=stage_kb(track, stage),
-                        )
-            except TelegramBadRequest:
-                # Already edited / can't edit / removed. Best-effort.
-                pass
+            await self._set_stage_kb(target, track, stage)
 
         await set_stage("downloading")
         used_fit_reencode = False
         reencoded_kbps = 0
         with tempfile.TemporaryDirectory(prefix="dlmus_") as tmp:
             result = await self._download_with_retries(
-                provider, track, tmp, on_stage=set_stage,
+                provider,
+                track,
+                tmp,
+                on_stage=set_stage,
             )
             trimmed_path, removed_silence_s = await trim_long_edge_silence(
                 result.file_path,
@@ -366,10 +486,12 @@ class JobRunner:
             )
             if removed_silence_s > 0 and trimmed_path != Path(result.file_path):
                 new_size = trimmed_path.stat().st_size
-                result = result.model_copy(update={
-                    "file_path": str(trimmed_path),
-                    "size_bytes": new_size,
-                })
+                result = result.model_copy(
+                    update={
+                        "file_path": str(trimmed_path),
+                        "size_bytes": new_size,
+                    }
+                )
                 logger.info(
                     "<cyan>[audio]</cyan> [{}] removed {:.1f}s edge silence",
                     tag,
@@ -386,31 +508,40 @@ class JobRunner:
                 # that, the audio sounds bad enough that delivering
                 # it isn't worth it.
                 target_kbps = target_bitrate_for_size(
-                    result.track.duration_seconds, self._max_file_mb,
+                    result.track.duration_seconds,
+                    self._max_file_mb,
                 )
                 if target_kbps == 0:
                     logger.warning(
                         "[{}] downloaded {:.1f} MiB > {} MB cap and even "
                         "low-bitrate re-encoding wouldn't fit (duration "
                         "{}); marking too_big",
-                        tag, size_mb, self._max_file_mb,
+                        tag,
+                        size_mb,
+                        self._max_file_mb,
                         result.track.duration_str,
                     )
                     await self._mark_dead("too_big", target, track)
                     return
                 logger.info(
                     "[{}] {:.1f} MiB > {} MB cap; re-encoding at {} kbps to fit",
-                    tag, size_mb, self._max_file_mb, target_kbps,
+                    tag,
+                    size_mb,
+                    self._max_file_mb,
+                    target_kbps,
                 )
                 await set_stage("fitting")
                 new_path = await transcode_to_mp3(
-                    result.file_path, bitrate_kbps=target_kbps,
+                    result.file_path,
+                    bitrate_kbps=target_kbps,
                 )
                 if new_path is None:
                     # ffmpeg unavailable — can't shrink, give up.
                     logger.warning(
                         "[{}] ffmpeg unavailable; can't fit {:.1f} MiB to {} MB cap",
-                        tag, size_mb, self._max_file_mb,
+                        tag,
+                        size_mb,
+                        self._max_file_mb,
                     )
                     await self._mark_dead("too_big", target, track)
                     return
@@ -419,17 +550,22 @@ class JobRunner:
                 if new_mb > self._max_file_mb:
                     logger.warning(
                         "[{}] re-encoded to {} kbps but still {:.1f} MiB > {} MB; giving up",
-                        tag, target_kbps, new_mb, self._max_file_mb,
+                        tag,
+                        target_kbps,
+                        new_mb,
+                        self._max_file_mb,
                     )
                     await self._mark_dead("too_big", target, track)
                     return
                 # Swap the result to point at the shrunk file.
-                result = result.model_copy(update={
-                    "file_path": str(new_path),
-                    "size_bytes": new_size,
-                    "format_name": f"MP3_{target_kbps}_CBR",
-                    "mime_type": "audio/mpeg",
-                })
+                result = result.model_copy(
+                    update={
+                        "file_path": str(new_path),
+                        "size_bytes": new_size,
+                        "format_name": f"MP3_{target_kbps}_CBR",
+                        "mime_type": "audio/mpeg",
+                    }
+                )
                 used_fit_reencode = True
                 reencoded_kbps = target_kbps
                 size_mb = new_mb
@@ -458,29 +594,36 @@ class JobRunner:
                 source_kbps = min(source_kbps, 320)
                 logger.info(
                     "[{}] {} detected; transcoding to MP3 {} kbps (matching source)",
-                    tag, ext_now.lstrip("."), source_kbps,
+                    tag,
+                    ext_now.lstrip("."),
+                    source_kbps,
                 )
                 mp3_path = await transcode_to_mp3(
-                    result.file_path, bitrate_kbps=source_kbps,
+                    result.file_path,
+                    bitrate_kbps=source_kbps,
                 )
                 if mp3_path is None:
                     logger.warning(
                         "[{}] ffmpeg unavailable; cannot convert {} to MP3 — proceeding with original",
-                        tag, ext_now,
+                        tag,
+                        ext_now,
                     )
                 else:
                     new_size = mp3_path.stat().st_size
-                    result = result.model_copy(update={
-                        "file_path": str(mp3_path),
-                        "size_bytes": new_size,
-                        "format_name": f"MP3_{source_kbps}_FROM_{result.format_name}",
-                        "mime_type": "audio/mpeg",
-                    })
+                    result = result.model_copy(
+                        update={
+                            "file_path": str(mp3_path),
+                            "size_bytes": new_size,
+                            "format_name": f"MP3_{source_kbps}_FROM_{result.format_name}",
+                            "mime_type": "audio/mpeg",
+                        }
+                    )
                     size_mb = new_size / 1024 / 1024
 
             logger.debug(
                 "[{}] embedding metadata + cover into {}",
-                tag, Path(result.file_path).name,
+                tag,
+                Path(result.file_path).name,
             )
             await set_stage("tagging")
             cover_bytes: Optional[bytes] = None
@@ -493,16 +636,22 @@ class JobRunner:
 
             logger.info(
                 "[{}] uploading to Telegram ({:.2f} MiB, {})",
-                tag, size_mb, result.format_name,
+                tag,
+                size_mb,
+                result.format_name,
             )
             await set_stage("uploading")
             sent = await self._deliver_audio(
-                target, result, cover_bytes,
+                target,
+                result,
+                cover_bytes,
                 original_spotify_url=target.original_spotify_url,
                 reencoded=used_fit_reencode,
                 reencoded_kbps=reencoded_kbps,
             )
-            sent_kind, sent_file_id, sent_unique_id, sent_mime_type = self._extract_media_ids(sent)
+            sent_kind, sent_file_id, sent_unique_id, sent_mime_type = (
+                self._extract_media_ids(sent)
+            )
             logger.info(
                 "[{}] telegram accepted upload as kind={} mime={} ext={} fmt={}",
                 tag,
@@ -528,7 +677,8 @@ class JobRunner:
             if sent_file_id:
                 logger.info(
                     "[{}] delivered to chat={} file_id={}",
-                    tag, target.chat_id or target.user_id,
+                    tag,
+                    target.chat_id or target.user_id,
                     sent_file_id,
                 )
                 # Successful delivery — wipe any prior retry tally
@@ -537,7 +687,9 @@ class JobRunner:
                 if target.inline_message_id is not None:
                     self._inline_failures.pop(target.inline_message_id, None)
                 bot_stats.schedule_record(
-                    track.provider, track.track_id, target.user_id or 0,
+                    track.provider,
+                    track.track_id,
+                    target.user_id or 0,
                 )
             file_id_for_inline: Optional[str] = None
             # Only cache + use for inline when it's an audio file_id. Voice
@@ -565,13 +717,17 @@ class JobRunner:
         # source/artist row + the warning indicator, mirroring DM mode).
         if file_id_for_inline:
             inline_updated = await self._update_inline_with_audio(
-                target, result.track, file_id_for_inline,
+                target,
+                result.track,
+                file_id_for_inline,
                 original_spotify_url=target.original_spotify_url,
                 reencoded_kbps=reencoded_kbps,
             )
 
             if not inline_updated:
-                await self._set_inline_kb(target, failed_kb(track.provider, track.track_id))
+                await self._set_inline_kb(
+                    target, failed_kb(track.provider, track.track_id)
+                )
         elif target.inline_message_id:
             logger.warning(
                 "[{}] delivered but no reusable media id returned; clearing inline loading kb",
@@ -590,7 +746,12 @@ class JobRunner:
         if sent is None:
             return None, None, None, None
         if sent.audio is not None:
-            return "audio", sent.audio.file_id, sent.audio.file_unique_id, sent.audio.mime_type
+            return (
+                "audio",
+                sent.audio.file_id,
+                sent.audio.file_unique_id,
+                sent.audio.mime_type,
+            )
         if sent.document is not None:
             return (
                 "document",
@@ -617,15 +778,21 @@ class JobRunner:
         if mp3_path is None or not mp3_path.is_file():
             return None
         new_size = mp3_path.stat().st_size
-        return result.model_copy(update={
-            "file_path": str(mp3_path),
-            "size_bytes": new_size,
-            "format_name": f"MP3_{bitrate_kbps}_INLINE_RESCUE",
-            "mime_type": "audio/mpeg",
-        })
+        return result.model_copy(
+            update={
+                "file_path": str(mp3_path),
+                "size_bytes": new_size,
+                "format_name": f"MP3_{bitrate_kbps}_INLINE_RESCUE",
+                "mime_type": "audio/mpeg",
+            }
+        )
 
     async def _download_with_retries(
-        self, provider: Provider, track: Track, dest_dir: str, *,
+        self,
+        provider: Provider,
+        track: Track,
+        dest_dir: str,
+        *,
         on_stage,
     ):
         """Run `provider.download(...)` with up to `MAX_DOWNLOAD_ATTEMPTS`
@@ -642,7 +809,9 @@ class JobRunner:
         for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
             try:
                 return await provider.download(
-                    track, dest_dir, on_stage=on_stage,
+                    track,
+                    dest_dir,
+                    on_stage=on_stage,
                 )
             except FileTooLargeError:
                 raise
@@ -654,8 +823,12 @@ class JobRunner:
                     break
                 logger.warning(
                     "[{}:{}] download attempt {}/{} failed ({}); retrying in {:.1f}s",
-                    track.provider, track.track_id, attempt,
-                    MAX_DOWNLOAD_ATTEMPTS, e, DOWNLOAD_RETRY_DELAY_S,
+                    track.provider,
+                    track.track_id,
+                    attempt,
+                    MAX_DOWNLOAD_ATTEMPTS,
+                    e,
+                    DOWNLOAD_RETRY_DELAY_S,
                 )
                 await asyncio.sleep(DOWNLOAD_RETRY_DELAY_S)
         # All attempts exhausted — re-raise the last ProviderError so the
@@ -675,20 +848,26 @@ class JobRunner:
             file_id=cached.file_id,
         )
         await self._deliver_audio(
-            target, synthetic, cover_bytes=None,
+            target,
+            synthetic,
+            cover_bytes=None,
             original_spotify_url=target.original_spotify_url,
             reencoded=cached.reencoded,
             reencoded_kbps=cached.reencoded_kbps,
         )
         bot_stats.schedule_record(
-            track.provider, track.track_id, target.user_id or 0,
+            track.provider,
+            track.track_id,
+            target.user_id or 0,
         )
         # Inline article → audio in-place via cached file_id. Carry the
         # re-encoded marker forward so cache hits look identical to the
         # very first delivery (warning button + source/artist row).
         if target.inline_message_id is not None:
             inline_ok = await self._update_inline_with_audio(
-                target, track, cached.file_id,
+                target,
+                track,
+                cached.file_id,
                 original_spotify_url=target.original_spotify_url,
                 reencoded_kbps=cached.reencoded_kbps,
             )
@@ -699,7 +878,8 @@ class JobRunner:
                 logger.warning(
                     "[{}:{}] cached file_id rejected by inline edit; "
                     "evicting stale entry",
-                    track.provider, track.track_id,
+                    track.provider,
+                    track.track_id,
                 )
                 await self._cache.remove(track.provider, track.track_id)
 
@@ -729,7 +909,8 @@ class JobRunner:
 
         thumb_ref = (
             BufferedInputFile(thumb_bytes, filename="cover.jpg")
-            if thumb_bytes else None
+            if thumb_bytes
+            else None
         )
 
         cap = self.caption(result.track, original_spotify_url=original_spotify_url)
@@ -760,12 +941,15 @@ class JobRunner:
         if target.status_message_id is not None:
             try:
                 await self._bot.delete_message(
-                    chat_id=chat_id, message_id=target.status_message_id,
+                    chat_id=chat_id,
+                    message_id=target.status_message_id,
                 )
             except TelegramBadRequest as e:
                 logger.warning(
                     "couldn't delete placeholder {} in {}: {}",
-                    target.status_message_id, chat_id, e,
+                    target.status_message_id,
+                    chat_id,
+                    e,
                 )
             target.status_message_id = None
 
@@ -820,7 +1004,9 @@ class JobRunner:
                 e,
             )
 
-    async def _send_forward_attribution(self, user_id: int, reply_to_message_id: int) -> None:
+    async def _send_forward_attribution(
+        self, user_id: int, reply_to_message_id: int
+    ) -> None:
         if not self._forward_log_channel_id:
             return
         try:
@@ -857,6 +1043,46 @@ class JobRunner:
             logger.warning("forward attribution send failed for {}: {}", user_id, e)
 
     # ---- status helpers ----------------------------------------------
+
+    async def _set_stage_kb(
+        self, target: DeliveryTarget, track: Track, stage: str
+    ) -> None:
+        """Edit the placeholder's status button to `stage`. Inline messages
+        get the bare status button; chat-mode keeps the [Source · Artist]
+        row above it. Best-effort — a failed edit is swallowed."""
+        try:
+            if target.inline_message_id:
+                await self._set_inline_kb(target, inline_stage_kb(stage))
+            elif target.status_message_id is not None:
+                chat_id = target.chat_id or target.user_id
+                if chat_id is not None:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=target.status_message_id,
+                        reply_markup=stage_kb(track, stage),
+                    )
+        except TelegramBadRequest:
+            # Already edited / can't edit / removed. Best-effort.
+            pass
+
+    async def _set_queue_kb(
+        self, target: DeliveryTarget, track: Track, position: int, total: int
+    ) -> None:
+        """Edit the placeholder's status button to a queue-position label
+        ("⏳ In queue N/M"). Same inline/chat split as `_set_stage_kb`."""
+        try:
+            if target.inline_message_id:
+                await self._set_inline_kb(target, inline_queue_kb(position, total))
+            elif target.status_message_id is not None:
+                chat_id = target.chat_id or target.user_id
+                if chat_id is not None:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=target.status_message_id,
+                        reply_markup=queue_kb(track, position, total),
+                    )
+        except TelegramBadRequest:
+            pass
 
     async def _set_inline_kb(
         self, target: DeliveryTarget, kb: Optional[InlineKeyboardMarkup]
@@ -935,7 +1161,10 @@ class JobRunner:
                 self._inline_failures.pop(mid, None)
                 logger.warning(
                     "[{}:{}] inline retry budget exhausted ({}/{}); marking final-fail",
-                    track.provider, track.track_id, attempts, MAX_INLINE_RETRIES,
+                    track.provider,
+                    track.track_id,
+                    attempts,
+                    MAX_INLINE_RETRIES,
                 )
             else:
                 kb = failed_kb(track.provider, track.track_id)
@@ -957,23 +1186,35 @@ class JobRunner:
             except Exception as e:
                 logger.error(
                     "_mark_failed edit_message_reply_markup failed chat={} mid={} ({}): {}",
-                    chat_id, target.status_message_id, type(e).__name__, e,
+                    chat_id,
+                    target.status_message_id,
+                    type(e).__name__,
+                    e,
                 )
         try:
             await self._bot.send_message(
                 chat_id=chat_id,
-                text="❌ <b>Couldn't deliver that one</b>",
+                text=self.caption(
+                    track,
+                    original_spotify_url=target.original_spotify_url,
+                ),
                 reply_to_message_id=target.reply_to_message_id,
                 reply_markup=kb,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.error(
                 "_mark_failed send_message failed chat={} ({}): {}",
-                chat_id, type(e).__name__, e,
+                chat_id,
+                type(e).__name__,
+                e,
             )
 
     async def _mark_dead(
-        self, reason: str, target: DeliveryTarget, track: Track,
+        self,
+        reason: str,
+        target: DeliveryTarget,
+        track: Track,
     ) -> None:
         """Permanent-failure exit: replaces the placeholder kb with
         `final_failed_kb(reason)` and clears any retry counter. The
@@ -1000,23 +1241,36 @@ class JobRunner:
             except Exception as e:
                 logger.error(
                     "_mark_dead edit_message_reply_markup failed chat={} mid={} reason={} ({}): {}",
-                    chat_id, target.status_message_id, reason, type(e).__name__, e,
+                    chat_id,
+                    target.status_message_id,
+                    reason,
+                    type(e).__name__,
+                    e,
                 )
         try:
             await self._bot.send_message(
                 chat_id=chat_id,
-                text="❌ <b>Couldn't deliver that one</b>",
+                text=self.caption(
+                    track,
+                    original_spotify_url=target.original_spotify_url,
+                ),
                 reply_to_message_id=target.reply_to_message_id,
                 reply_markup=kb,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.error(
                 "_mark_dead send_message failed chat={} reason={} ({}): {}",
-                chat_id, reason, type(e).__name__, e,
+                chat_id,
+                reason,
+                type(e).__name__,
+                e,
             )
 
     async def _mark_dm_blocked(
-        self, target: DeliveryTarget, track: Track,
+        self,
+        target: DeliveryTarget,
+        track: Track,
     ) -> None:
         """User hasn't opened the DM. Show the full purr-style permission row
         ([🔒 Permission Required] [💬 Please send /start] [🔄 Try Again])
@@ -1026,7 +1280,9 @@ class JobRunner:
         if self._dm_probe is not None:
             self._dm_probe.drop_open(target.user_id)
         kb = permission_required_kb(
-            self._bot_username, track.provider, track.track_id,
+            self._bot_username,
+            track.provider,
+            track.track_id,
         )
         if target.inline_message_id:
             await self._set_inline_kb(target, kb)
@@ -1048,19 +1304,28 @@ class JobRunner:
             except Exception as e:
                 logger.error(
                     "_mark_dm_blocked edit_message_reply_markup failed chat={} mid={} ({}): {}",
-                    chat_id, target.status_message_id, type(e).__name__, e,
+                    chat_id,
+                    target.status_message_id,
+                    type(e).__name__,
+                    e,
                 )
         try:
             await self._bot.send_message(
                 chat_id=chat_id,
-                text="🔒 <b>I can't DM you yet</b> — open a chat with me first.",
+                text=self.caption(
+                    track,
+                    original_spotify_url=target.original_spotify_url,
+                ),
                 reply_to_message_id=target.reply_to_message_id,
                 reply_markup=kb,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.error(
                 "_mark_dm_blocked send_message failed chat={} ({}): {}",
-                chat_id, type(e).__name__, e,
+                chat_id,
+                type(e).__name__,
+                e,
             )
 
 
@@ -1068,6 +1333,7 @@ class JobRunner:
 class _SyntheticResult:
     """Adapter so cached file_id deliveries flow through `_deliver_audio`
     using the same code path as fresh downloads."""
+
     track: Track
     file_path: str
     format_name: str

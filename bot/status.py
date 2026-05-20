@@ -39,6 +39,7 @@ STAGES: dict[str, tuple[str, str]] = {
 # handler tries the full key first and falls back to the base. Add new
 # reasons here without touching the dispatcher.
 STATUS_ALERTS: dict[str, str] = {
+    "queued": "Waiting in the download queue — your track will start soon.",
     "downloading": "Downloading the audio.",
     "decrypting": "Unscrambling the audio.",
     "converting": "Converting the audio.",
@@ -132,6 +133,17 @@ def downloading_button() -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text="⏳ Downloading...",
         callback_data="status:downloading",
+    )
+
+
+def queue_position_button(position: int, total: int) -> InlineKeyboardButton:
+    """Status button shown while a job is still waiting in a backed-up
+    download queue. Surfaces "you are Nth of M" so users on a busy bot can
+    see it's queued, not stalled. callback_data points at the `queued`
+    alert."""
+    return InlineKeyboardButton(
+        text=f"⏳ In queue {position}/{total}",
+        callback_data="status:queued",
     )
 
 
@@ -256,6 +268,17 @@ def stage_kb(track: Track, stage: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def queue_kb(track: Track, position: int, total: int) -> InlineKeyboardMarkup:
+    """Chat-mode placeholder kb with a live queue-position label in place
+    of the plain "Downloading..." button. Same row layout as `stage_kb`."""
+    rows: list[list[InlineKeyboardButton]] = []
+    r1 = _row_source_artist(track)
+    if r1:
+        rows.append(r1)
+    rows.append([queue_position_button(position, total)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def audio_kb(
     track: Track,
     *,
@@ -345,6 +368,14 @@ def inline_stage_kb(stage: str) -> InlineKeyboardMarkup:
     when delivery succeeds. Permission failures swap in
     `permission_required_kb` instead."""
     return InlineKeyboardMarkup(inline_keyboard=[[stage_button(stage)]])
+
+
+def inline_queue_kb(position: int, total: int) -> InlineKeyboardMarkup:
+    """Inline-mode queue-position kb — bare status button, no Source/Artist
+    row, mirroring `inline_stage_kb`."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[queue_position_button(position, total)]]
+    )
 
 
 # Alias retained for older imports.

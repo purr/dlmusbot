@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from aiogram import Bot, Dispatcher
@@ -15,6 +16,7 @@ from core.queue import DownloadQueue
 from providers.registry import build_default_registry
 
 from .dm_probe import DMProbe
+from .flood import flood_control_middleware
 from .handlers import ROUTERS
 from .jobs import JobRunner
 
@@ -41,13 +43,25 @@ async def run(cfg: Any) -> None:
     stats_file = getattr(cfg, "STATS_FILE", "") or "data/bot_stats.json"
     bot_stats.configure(stats_file)
     await bot_stats.load()
-    queue: DownloadQueue = DownloadQueue(concurrency=cfg.DOWNLOAD_CONCURRENCY)
+    # Download concurrency: one worker per CPU core by default. A positive
+    # DOWNLOAD_CONCURRENCY in config.py overrides the auto value.
+    configured = int(getattr(cfg, "DOWNLOAD_CONCURRENCY", 0) or 0)
+    if configured > 0:
+        concurrency = configured
+        log.info("download queue: %d workers (config override)", concurrency)
+    else:
+        concurrency = os.cpu_count() or 1
+        log.info("download queue: %d workers (1 per cpu core)", concurrency)
+    queue: DownloadQueue = DownloadQueue(concurrency=concurrency)
     await queue.start()
 
     bot = Bot(
         token=cfg.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),
     )
+    # Sits below every bot API call: waits out Telegram flood limits
+    # (TelegramRetryAfter) and retries, so throttling never crashes a job.
+    bot.session.middleware(flood_control_middleware)
     me = await bot.get_me()
     log.info("logged in as @%s (id=%s)", me.username, me.id)
 

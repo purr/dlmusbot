@@ -93,12 +93,10 @@ async def on_chosen(
                 )
         return
 
-    queue.submit(lambda: job_runner.run(
-        provider, track,
-        DeliveryTarget(
-            user_id=user_id,
-            inline_message_id=inline_msg_id,
-            request_query=(chosen.query or "").strip() or None,
-            request_source="chosen_inline_result",
-        ),
-    ))
+    target = DeliveryTarget(
+        user_id=user_id,
+        inline_message_id=inline_msg_id,
+        request_query=(chosen.query or "").strip() or None,
+        request_source="chosen_inline_result",
+    )
+    job_runner.enqueue(queue, provider, track, target)
