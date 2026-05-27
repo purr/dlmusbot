@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
 import aiohttp
-from loguru import logger as _log
 
 from core.exceptions import ProviderError
+from core.logging_setup import logger as _log
 from core.models import Album, ArtistRef, DownloadResult, Playlist, Track
 
 from ..base import Provider, StageCallback

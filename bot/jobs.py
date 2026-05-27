@@ -39,8 +39,6 @@ from aiogram.types import (
     InputMediaAudio,
     Message,
 )
-from loguru import logger as _logger
-
 from core import stats as bot_stats
 from core.audio_convert import (
     MIN_LISTENABLE_KBPS,
@@ -53,6 +51,7 @@ from core.audio_convert import (
 from core.cache import CachedAudio, FileIdCache
 from core.exceptions import DlmusError, DMNotOpenError, FileTooLargeError, ProviderError
 from core.fallback import FALLBACK_REASONS, MAX_FALLBACK_DEPTH, find_alternative_track
+from core.logging_setup import logger
 from core.models import DownloadResult, Track
 from core.queue import DownloadQueue
 from providers.base import Provider
@@ -72,10 +71,6 @@ from .status import (
 )
 from .tagging import embed_metadata, fetch_cover, prepare_telegram_thumbnail
 from .ui import format_track_caption
-
-# `.opt(colors=True)` enables inline markup parsing (`<cyan>...</cyan>`)
-# inside log messages — without it the tags are emitted literally.
-logger = _logger.opt(colors=True)
 
 _KBPS_IN_FORMAT = _re_mod.compile(r"(\d{2,4})")
 

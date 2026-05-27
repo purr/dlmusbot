@@ -17,7 +17,7 @@ from typing import Optional
 
 import aiohttp
 
-from loguru import logger
+from .logging_setup import logger
 
 
 _RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}

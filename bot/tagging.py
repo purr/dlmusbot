@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
-from loguru import logger
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, TPE2, TXXX, WXXX, WOAS
 from mutagen.mp4 import MP4, MP4Cover
@@ -22,8 +21,9 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 from PIL import Image
 
-from core.models import DownloadResult, Track
 from core.audio_convert import ffmpeg_available
+from core.logging_setup import logger
+from core.models import DownloadResult, Track
 
 
 # Telegram's thumbnail constraints for sendAudio:

@@ -4,7 +4,8 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 import aiohttp
-from loguru import logger
+
+from .logging_setup import logger
 
 _SHORTLINK_DOMAINS = frozenset({
     "spoti.fi",

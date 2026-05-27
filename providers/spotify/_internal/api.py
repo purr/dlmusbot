@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Optional
 
 import aiohttp
-from loguru import logger
+
+from core.logging_setup import logger
 
 from . import protobuf as pb
 from .exceptions import StorageResolveError, TrackUnavailableError

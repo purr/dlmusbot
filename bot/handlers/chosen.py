@@ -11,19 +11,14 @@ import contextlib
 from aiogram import Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import ChosenInlineResult
-from loguru import logger as _logger
-
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError
+from core.logging_setup import logger
 from providers.registry import Registry
 
 from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
 from ..status import failed_kb, final_failed_kb, permission_required_kb
-
-# `.opt(colors=True)` enables inline markup parsing (`<cyan>...</cyan>`)
-# inside log messages — without it the tags are emitted literally.
-logger = _logger.opt(colors=True)
 
 router = Router(name="chosen")
 

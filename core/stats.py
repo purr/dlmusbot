@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
+from .logging_setup import logger
 
 
 _SCHEMA = 1

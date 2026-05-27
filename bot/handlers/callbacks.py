@@ -20,10 +20,10 @@ from typing import Optional
 from aiogram import Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
-from loguru import logger
 
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError
+from core.logging_setup import logger
 from providers.registry import Registry
 
 from ..dm_probe import DMProbe

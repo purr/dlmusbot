@@ -36,12 +36,11 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
-from loguru import logger as _logger
-
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError, TrackNotFoundError
 from core.fallback import FALLBACK_REASONS, find_alternative_track
 from core.fuzz import dedupe_near_duplicates, dedupe_tracks, rank_balanced
+from core.logging_setup import logger
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
 from core.url_parser import parse as parse_url
@@ -55,10 +54,6 @@ from ..ui import (
     format_track_caption,
     visible_help_providers,
 )
-
-# `.opt(colors=True)` enables inline markup parsing (`<cyan>...</cyan>`)
-# inside log messages — without it the tags are emitted literally.
-logger = _logger.opt(colors=True)
 
 router = Router(name="inline")
 

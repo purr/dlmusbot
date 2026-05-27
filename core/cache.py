@@ -14,8 +14,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from loguru import logger
 from pydantic import BaseModel, Field
+
+from .logging_setup import logger
 
 
 class CachedAudio(BaseModel):

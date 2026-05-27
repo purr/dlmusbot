@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from loguru import logger
+from .logging_setup import logger
 
 
 # Lower bound for "still listenable" MP3 CBR. Below this, re-encoding to
