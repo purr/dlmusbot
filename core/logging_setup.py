@@ -9,9 +9,21 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import sys
 
 from loguru import logger
+
+# Windows PowerShell / CMD don't enable ANSI escape sequences by default,
+# so loguru's auto-detect emits no color. colorama's one-liner enables
+# Virtual Terminal Processing on the current console so the codes that
+# loguru produces actually render.
+if os.name == "nt":
+    try:
+        import colorama
+        colorama.just_fix_windows_console()
+    except ImportError:
+        pass
 
 
 # Suppress these to WARN (they're noisy at INFO).
@@ -49,7 +61,7 @@ class InterceptHandler(logging.Handler):
 _FORMAT = (
     "<green>{time:HH:mm:ss.SSS}</green> "
     "<level>{level: <7}</level> "
-    "<cyan>{name}</cyan>:<cyan>{line}</cyan> "
+    "<dim><cyan>{name}</cyan>:<cyan>{line}</cyan></dim> "
     "<level>{message}</level>"
 )
 

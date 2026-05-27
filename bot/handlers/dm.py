@@ -13,7 +13,7 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from loguru import logger
+from loguru import logger as _logger
 
 from core.exceptions import (
     DlmusError,
@@ -30,6 +30,10 @@ from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
 from ..status import failed_kb, final_failed_kb, placeholder_kb
 from ..ui import PREPARING_TEXT, format_url_caption
+
+# `.opt(colors=True)` enables inline markup parsing (`<cyan>...</cyan>`)
+# inside log messages — without it the tags are emitted literally.
+logger = _logger.opt(colors=True)
 
 # Pretty labels for the album/playlist DM-rejection notice.
 _KIND_LABEL = {
