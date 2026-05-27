@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import re as _re_mod
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -38,7 +39,7 @@ from aiogram.types import (
     InputMediaAudio,
     Message,
 )
-from loguru import logger
+from loguru import logger as _logger
 
 from core import stats as bot_stats
 from core.audio_convert import (
@@ -72,6 +73,10 @@ from .status import (
 from .tagging import embed_metadata, fetch_cover, prepare_telegram_thumbnail
 from .ui import format_track_caption
 
+# `.opt(colors=True)` enables inline markup parsing (`<cyan>...</cyan>`)
+# inside log messages — without it the tags are emitted literally.
+logger = _logger.opt(colors=True)
+
 _KBPS_IN_FORMAT = _re_mod.compile(r"(\d{2,4})")
 
 
@@ -93,11 +98,43 @@ def _guess_source_kbps(format_name: str) -> Optional[int]:
     return None
 
 
+# Substrings (lowercased) that Telegram puts in a BadRequest message
+# when the cached file_id itself is no longer usable — could be a
+# cross-bot id (file_ids are bot-scoped), a rotated id, or an expired
+# file reference. Centralised so `_is_stale_file_id_error` stays a
+# one-liner and new variants can be added without touching call sites.
+_STALE_FILE_ID_KEYWORDS: tuple[str, ...] = (
+    "wrong file identifier",
+    "wrong file_id",
+    "wrong file id",
+    "file_id_invalid",
+    "file_reference_invalid",
+    "file reference invalid",
+    "file reference expired",
+    "file reference has expired",
+    # Telegram's literal phrasing when a bot tries to forward another
+    # bot's file_id — same root cause, different message wording.
+    "can't use file_id of one bot in another bot",
+    "use file_id of one bot",
+)
+
+
+def _is_stale_file_id_error(exc: TelegramBadRequest) -> bool:
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _STALE_FILE_ID_KEYWORDS)
+
+
 # Hard cap on retries per inline message. After this many consecutive
 # failures we replace the kb with `final_failed_kb` (no retry button) so
 # the user gets clear feedback that further clicks won't help. Counts are
 # scoped per inline_message_id and reset on a successful delivery.
 MAX_INLINE_RETRIES = 2
+
+# Cap on the live failure-counter LRU. 4096 entries × ~80 bytes each
+# (str key + int value) ≈ 320 KB max — small, but bounded. Eviction
+# is move-to-end on access + popitem(last=False) on overflow, so the
+# oldest never-cleared entry is the one we forget first.
+INLINE_FAILURES_CAP = 4096
 
 # Internal per-attempt retry budget for the actual download step. Spotify
 # CDN edges, SoundCloud client_id rotation, transient TLS hiccups — all
@@ -158,7 +195,12 @@ class JobRunner:
         # consecutive failure count. Bumped on _mark_failed, cleared on a
         # successful delivery. Once it reaches MAX_INLINE_RETRIES we swap
         # in `final_failed_kb` so the user knows further clicks won't help.
-        self._inline_failures: dict[str, int] = {}
+        #
+        # OrderedDict + a cap = poor-man's LRU. A user who triggers a
+        # failure and never clicks retry would otherwise leak ~24 bytes
+        # per inline_message_id forever; the cap keeps the bot's RSS
+        # stable across long uptime regardless of inbound traffic.
+        self._inline_failures: "OrderedDict[str, int]" = OrderedDict()
         # Strong refs to in-flight queue-position tracker tasks so the
         # event loop doesn't GC them mid-run. Each task discards itself
         # from this set on completion.
@@ -422,8 +464,28 @@ class JobRunner:
         cached = await self._cache.get(track.provider, track.track_id)
         if cached and cached.file_id:
             logger.info("[{}] cache hit -> file_id={}", tag, cached.file_id)
-            await self._deliver_cached(track, cached, target)
-            return
+            try:
+                await self._deliver_cached(track, cached, target)
+                return
+            except TelegramBadRequest as e:
+                # Any BadRequest whose message points at the file_id
+                # itself means the cached id can no longer be sent —
+                # could be a different bot uploaded it (file_ids are
+                # bot-scoped), a rotated id, or an expired reference.
+                # Evict the single stale entry and fall through to the
+                # normal download path so this user still gets the
+                # track AND the next request gets a fresh, valid id.
+                # We don't touch the rest of the cache.
+                if _is_stale_file_id_error(e):
+                    logger.warning(
+                        "[{}] cached file_id rejected by Telegram ({}); "
+                        "evicting this entry + re-downloading",
+                        tag, e,
+                    )
+                    await self._cache.remove(track.provider, track.track_id)
+                    # Fall through to the normal download path below.
+                else:
+                    raise
 
         # Upfront feasibility check: Telegram caps bot uploads at 50 MB.
         # If the track is so long that even compressing to the lowest
@@ -864,20 +926,18 @@ class JobRunner:
         # re-encoded marker forward so cache hits look identical to the
         # very first delivery (warning button + source/artist row).
         if target.inline_message_id is not None:
-            inline_ok = await self._update_inline_with_audio(
+            inline_status = await self._update_inline_with_audio(
                 target,
                 track,
                 cached.file_id,
                 original_spotify_url=target.original_spotify_url,
                 reencoded_kbps=cached.reencoded_kbps,
             )
-            if not inline_ok:
-                # Stale voice-typed file_id from before the kind=voice
-                # detection was in place. Drop it so the next click
-                # re-downloads + re-uploads fresh as MP3.
+            # Tri-state: True = ok, False = stale id (evict), None =
+            # transient (don't touch the cache — file_id is still good).
+            if inline_status is False:
                 logger.warning(
-                    "[{}:{}] cached file_id rejected by inline edit; "
-                    "evicting stale entry",
+                    "[{}:{}] cached file_id is stale; evicting entry",
                     track.provider,
                     track.track_id,
                 )
@@ -1102,13 +1162,23 @@ class JobRunner:
         file_id: str,
         original_spotify_url: Optional[str] = None,
         reencoded_kbps: int = 0,
-    ) -> bool:
+    ) -> Optional[bool]:
         """Convert the inline article into an audio message in-place via
         edit_message_media with a cached file_id. Attaches the source +
         artist links and (when applicable) a permanent "re-encoded to N
         kbps MP3" indicator so users see the same context they'd see in
         a DM-mode delivery. Pass `reencoded_kbps=0` for normal-fit
-        deliveries to keep the inline message clean."""
+        deliveries to keep the inline message clean.
+
+        Returns a tri-state:
+          * `True`  — edit succeeded
+          * `False` — edit rejected because the file_id itself is bad
+            (cross-bot id, expired reference, …). Caller MUST evict the
+            cache entry to force a re-download.
+          * `None`  — edit failed for a transient reason (network blip,
+            "message is not modified", …). Caller MUST NOT evict — the
+            file_id is still good, the next attempt may succeed.
+        """
         if not target.inline_message_id:
             return False
 
@@ -1137,16 +1207,28 @@ class JobRunner:
                 reply_markup=kb,
             )
             return True
-        except (TelegramBadRequest, TelegramNetworkError) as e:
+        except TelegramBadRequest as e:
+            stale = _is_stale_file_id_error(e)
             logger.warning(
-                "inline edit_message_media failed for [{}:{}] file_id={} ({}): {}",
+                "inline edit_message_media {} for [{}:{}] file_id={} ({}): {}",
+                "rejected stale file_id" if stale else "failed (non-stale)",
                 track.provider,
                 track.track_id,
                 file_id[:24] + "...",
                 type(e).__name__,
                 e,
             )
-            return False
+            # Only the stale-id case warrants cache eviction. Other
+            # BadRequests (caption too long, message not modified, …)
+            # are transient with respect to the file_id itself.
+            return False if stale else None
+        except TelegramNetworkError as e:
+            # Network blip — file_id is still valid, retry later.
+            logger.warning(
+                "inline edit_message_media network error for [{}:{}]: {}",
+                track.provider, track.track_id, e,
+            )
+            return None
 
     async def _mark_failed(self, target: DeliveryTarget, track: Track) -> None:
         # For inline targets, track consecutive failures per inline message.
@@ -1154,8 +1236,14 @@ class JobRunner:
         # terminal-failure label — clicking won't help, so don't suggest it.
         if target.inline_message_id is not None:
             mid = target.inline_message_id
-            attempts = self._inline_failures.get(mid, 0) + 1
+            attempts = self._inline_failures.pop(mid, 0) + 1
+            # Re-insert at the end (most-recently-used) so the LRU prune
+            # below forgets entries that nobody has touched in a while.
             self._inline_failures[mid] = attempts
+            # Bounded LRU: evict oldest never-cleared entries past the
+            # cap so a long-running bot can't leak ids forever.
+            while len(self._inline_failures) > INLINE_FAILURES_CAP:
+                self._inline_failures.popitem(last=False)
             if attempts >= MAX_INLINE_RETRIES:
                 kb = final_failed_kb()
                 self._inline_failures.pop(mid, None)
