@@ -15,13 +15,10 @@ from loguru import logger as _log
 
 from core.exceptions import ProviderError
 from core.models import Album, ArtistRef, DownloadResult, Playlist, Track
-from ..base import StageCallback
 
+from ..base import Provider, StageCallback
 from . import search as search_mod
-from ._internal import (
-    SpotifyDownloaderError,
-    download_track_with_session,
-)
+from ._internal import SpotifyDownloaderError, download_track_with_session
 from ._internal import api as api_mod
 from ._internal.auth import DEFAULT_HEADERS, HTTP_TIMEOUT, get_access_token
 from ._internal.exceptions import (
@@ -35,13 +32,15 @@ from ._internal.ids import base62_to_gid, parse_track_id
 from ._internal.librespot import Session
 from ._internal.models import Album as _SpAlbum
 from ._internal.models import Track as _SpTrack
-from ..base import Provider
 
 T = TypeVar("T")
 
 # Errors that mean "the cached AP socket is dead — reconnect and retry".
 _RECONNECTABLE = (
-    HandshakeError, MercuryError, OSError, asyncio.IncompleteReadError,
+    HandshakeError,
+    MercuryError,
+    OSError,
+    asyncio.IncompleteReadError,
     ConnectionError,
 )
 
@@ -75,6 +74,7 @@ SPOTIFY_FORMAT_PRIORITY: list[str] = [
     "OGG_VORBIS_96",
 ]
 
+
 def _decrypt_concurrency_from_cores() -> int:
     """Pick a safe decrypt concurrency based on host CPU count.
 
@@ -87,6 +87,7 @@ def _decrypt_concurrency_from_cores() -> int:
     if cores <= 2:
         return 1
     return max(1, min(4, cores // 2))
+
 
 # Max tracks we'll hydrate per Spotify playlist. Each Mercury hop is ~50ms
 # and serialised by Session._lock, so 50 tracks ≈ 2.5s — fits inside the
@@ -123,17 +124,19 @@ def _album_from_internal(
             )
             for a in (list(st.artists) + list(st.featured_artists))
         ]
-        tracks.append(Track(
-            provider="spotify",
-            track_id=st.spotify_id,
-            title=st.name,
-            artists=t_artists,
-            album=sp_album.name,
-            duration_seconds=st.duration_ms // 1000,
-            artwork_url=cover,
-            url=st.spotify_url,
-            extra={"album_id": sp_album.spotify_id},
-        ))
+        tracks.append(
+            Track(
+                provider="spotify",
+                track_id=st.spotify_id,
+                title=st.name,
+                artists=t_artists,
+                album=sp_album.name,
+                duration_seconds=st.duration_ms // 1000,
+                artwork_url=cover,
+                url=st.spotify_url,
+                extra={"album_id": sp_album.spotify_id},
+            )
+        )
     return Album(
         provider="spotify",
         album_id=sp_album.spotify_id,
@@ -176,10 +179,30 @@ class SpotifyProvider(Provider):
     label = "Spotify"
 
     URL_PATTERNS = [
-        ("track", re.compile(r"open\.spotify\.com/(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]{22})")),
-        ("album", re.compile(r"open\.spotify\.com/(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]{22})")),
-        ("playlist", re.compile(r"open\.spotify\.com/(?:intl-[a-z]{2}/)?playlist/([A-Za-z0-9]{22})")),
-        ("artist", re.compile(r"open\.spotify\.com/(?:intl-[a-z]{2}/)?artist/([A-Za-z0-9]{22})")),
+        (
+            "track",
+            re.compile(
+                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]{22})"
+            ),
+        ),
+        (
+            "album",
+            re.compile(
+                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]{22})"
+            ),
+        ),
+        (
+            "playlist",
+            re.compile(
+                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?playlist/([A-Za-z0-9]{22})"
+            ),
+        ),
+        (
+            "artist",
+            re.compile(
+                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?artist/([A-Za-z0-9]{22})"
+            ),
+        ),
         ("track", re.compile(r"spotify:track:([A-Za-z0-9]{22})")),
         ("album", re.compile(r"spotify:album:([A-Za-z0-9]{22})")),
         ("playlist", re.compile(r"spotify:playlist:([A-Za-z0-9]{22})")),
@@ -217,7 +240,8 @@ class SpotifyProvider(Provider):
     async def start(self) -> None:
         if self._http is None:
             self._http = aiohttp.ClientSession(
-                headers=DEFAULT_HEADERS, timeout=HTTP_TIMEOUT,
+                headers=DEFAULT_HEADERS,
+                timeout=HTTP_TIMEOUT,
             )
 
     async def close(self) -> None:
@@ -225,6 +249,20 @@ class SpotifyProvider(Provider):
         if self._http is not None:
             await self._http.close()
             self._http = None
+
+    async def warmup(self) -> None:
+        """Mint the Web-API access token + open the librespot AP session
+        ahead of the first user request. Without this the first inline
+        search after restart times out at the 3s budget while the TOTP
+        handshake + AP login (often 5-40s combined) run inline."""
+        t0 = time.time()
+        await self._access_token()
+        try:
+            await self._get_session()
+        except Exception as e:
+            _log.warning("[spotify] warmup session open failed: %s", e)
+            return
+        _log.info("[spotify] warmup complete ({:.2f}s)", time.time() - t0)
 
     async def _access_token(self, *, force_refresh: bool = False) -> str:
         """Return a valid bearer token.
@@ -235,22 +273,14 @@ class SpotifyProvider(Provider):
         `force_refresh=True` after a 401 to invalidate the cache and mint
         a fresh token even if the cached one *looks* valid by clock."""
         now = time.time()
-        if (
-            not force_refresh
-            and self._token
-            and now < self._token_expires_at
-        ):
+        if not force_refresh and self._token and now < self._token_expires_at:
             return self._token
         async with self._token_lock:
             now = time.time()
             # Re-check inside the lock so the loser of a refresh race
             # picks up the freshly minted token instead of doing its own
             # round-trip.
-            if (
-                not force_refresh
-                and self._token
-                and now < self._token_expires_at
-            ):
+            if not force_refresh and self._token and now < self._token_expires_at:
                 return self._token
             assert self._http is not None
             token_info = await get_access_token(self._sp_dc, session=self._http)
@@ -258,9 +288,7 @@ class SpotifyProvider(Provider):
             self._token_fetched_at = now
             expiry_ms = token_info.get("accessTokenExpirationTimestampMs")
             if isinstance(expiry_ms, (int, float)) and expiry_ms > 0:
-                self._token_expires_at = (
-                    expiry_ms / 1000.0 - TOKEN_REFRESH_LEEWAY_S
-                )
+                self._token_expires_at = expiry_ms / 1000.0 - TOKEN_REFRESH_LEEWAY_S
             else:
                 self._token_expires_at = now + TOKEN_TTL_SECONDS
             _log.info(
@@ -270,7 +298,8 @@ class SpotifyProvider(Provider):
             return self._token
 
     async def _with_token_retry(
-        self, fn: Callable[[str], Awaitable[T]],
+        self,
+        fn: Callable[[str], Awaitable[T]],
     ) -> T:
         """Run a token-using HTTP call, refreshing once on a 401. Spotify
         rotates bearer tokens server-side without warning, and our local
@@ -315,13 +344,18 @@ class SpotifyProvider(Provider):
                 try:
                     await sess.close()
                 except Exception as ce:
-                    log.error("error closing failed Spotify session (%s): %s", type(ce).__name__, ce)
+                    log.error(
+                        "error closing failed Spotify session (%s): %s",
+                        type(ce).__name__,
+                        ce,
+                    )
                 raise
             self._session = sess
             return sess
 
     async def _with_session(
-        self, fn: Callable[[Session], Awaitable[T]],
+        self,
+        fn: Callable[[Session], Awaitable[T]],
     ) -> T:
         """Run an operation against the cached session. AP sockets die for
         all sorts of reasons (idle drops, server-side rotations, transient
@@ -338,8 +372,10 @@ class SpotifyProvider(Provider):
                 if attempt >= _SESSION_RETRY_ATTEMPTS:
                     break
                 log.warning(
-                    "spotify session call failed (%s) attempt %d/%d; "
-                    "reconnecting", e, attempt, _SESSION_RETRY_ATTEMPTS,
+                    "spotify session call failed (%s) attempt %d/%d; reconnecting",
+                    e,
+                    attempt,
+                    _SESSION_RETRY_ATTEMPTS,
                 )
                 await self._drop_session()
                 await asyncio.sleep(_SESSION_RETRY_DELAY_S * attempt)
@@ -365,7 +401,10 @@ class SpotifyProvider(Provider):
         try:
             return await self._with_token_retry(
                 lambda tok: search_mod.search_tracks(
-                    self._http, tok, query, limit,
+                    self._http,
+                    tok,
+                    query,
+                    limit,
                 )
             )
         except SpotifyDownloaderError as e:
@@ -384,7 +423,8 @@ class SpotifyProvider(Provider):
             # as an `unavailable` permanent failure so the bot shows the
             # right popup instead of the generic retry kb.
             raise ProviderError(
-                f"spotify track {entity_id} unavailable: {e}", reason="unavailable",
+                f"spotify track {entity_id} unavailable: {e}",
+                reason="unavailable",
             ) from e
         except SpotifyDownloaderError as e:
             raise ProviderError(f"spotify track fetch failed: {e}") from e
@@ -406,7 +446,12 @@ class SpotifyProvider(Provider):
                 try:
                     st = await api_mod.fetch_track_basic(s, g)
                 except SpotifyDownloaderError as e:
-                    log.error("album track hydration skipped for gid=%s (%s): %s", g, type(e).__name__, e)
+                    log.error(
+                        "album track hydration skipped for gid=%s (%s): %s",
+                        g,
+                        type(e).__name__,
+                        e,
+                    )
                     continue
                 if st is not None:
                     sp_tracks.append(st)
@@ -436,7 +481,12 @@ class SpotifyProvider(Provider):
                 try:
                     st = await api_mod.fetch_track_basic(s, g)
                 except SpotifyDownloaderError as e:
-                    log.error("artist top-track hydration skipped for gid=%s (%s): %s", g, type(e).__name__, e)
+                    log.error(
+                        "artist top-track hydration skipped for gid=%s (%s): %s",
+                        g,
+                        type(e).__name__,
+                        e,
+                    )
                     continue
                 if st is not None:
                     sp_tracks.append(st)
@@ -496,9 +546,7 @@ class SpotifyProvider(Provider):
                         )
                     return await r.json(content_type=None)
             except aiohttp.ClientError as e:
-                raise ProviderError(
-                    f"spotify playlist network error: {e}"
-                ) from e
+                raise ProviderError(f"spotify playlist network error: {e}") from e
 
         data = await self._with_token_retry(_load)
         if data is None:
@@ -523,7 +571,8 @@ class SpotifyProvider(Provider):
             # spclient sometimes omits length on small playlists; the URI
             # list itself is then the source of truth (uncapped count).
             uri_count = sum(
-                1 for it in items
+                1
+                for it in items
                 if (it or {}).get("uri", "").startswith("spotify:track:")
             )
             full_length = uri_count
@@ -535,7 +584,12 @@ class SpotifyProvider(Provider):
                 try:
                     st = await api_mod.fetch_track_basic(s, gid)
                 except SpotifyDownloaderError as e:
-                    log.error("playlist track hydration skipped for tid=%s (%s): %s", tid, type(e).__name__, e)
+                    log.error(
+                        "playlist track hydration skipped for tid=%s (%s): %s",
+                        tid,
+                        type(e).__name__,
+                        e,
+                    )
                     continue
                 if st is None:
                     continue
@@ -560,7 +614,8 @@ class SpotifyProvider(Provider):
     # ---- download --------------------------------------------------------
 
     def _make_progress_logger(
-        self, track_id: str,
+        self,
+        track_id: str,
         on_stage: Optional[StageCallback] = None,
     ) -> Callable[[str, dict], Awaitable[None]]:
         """Build a progress callback that:
@@ -592,7 +647,11 @@ class SpotifyProvider(Provider):
                     artists = ", ".join(a.name for a in t.artists) or "?"
                     _log.info(
                         "[{}] metadata: {} - {} ({}) [{} files] ({:.2f}s)",
-                        tag, artists, t.name, t.duration_str, len(t.files),
+                        tag,
+                        artists,
+                        t.name,
+                        t.duration_str,
+                        len(t.files),
                         float(info.get("elapsed_s") or 0.0),
                     )
             elif event == "format_selected":
@@ -628,15 +687,18 @@ class SpotifyProvider(Provider):
                     if 1 <= bucket <= 3 and bucket > last_bucket["v"]:
                         _log.debug(
                             "[{}] download {}% ({:.2f}/{:.2f} MiB)",
-                            tag, bucket * 25,
-                            received / 1048576, total / 1048576,
+                            tag,
+                            bucket * 25,
+                            received / 1048576,
+                            total / 1048576,
                         )
                         last_bucket["v"] = bucket
             elif event == "download_done":
                 size = info.get("size") or 0
                 _log.info(
                     "[{}] downloaded {:.2f} MiB encrypted ({:.2f}s)",
-                    tag, size / 1048576,
+                    tag,
+                    size / 1048576,
                     float(info.get("elapsed_s") or 0.0),
                 )
                 # The librespot pipeline immediately decrypts after the CDN
@@ -663,12 +725,16 @@ class SpotifyProvider(Provider):
         return cb
 
     async def download(
-        self, track: Track, dest_dir: str,
-        *, on_stage: Optional[StageCallback] = None,
+        self,
+        track: Track,
+        dest_dir: str,
+        *,
+        on_stage: Optional[StageCallback] = None,
     ) -> DownloadResult:
         _log.info(
             "[spotify:{}] starting download (priority={})",
-            track.track_id, SPOTIFY_FORMAT_PRIORITY,
+            track.track_id,
+            SPOTIFY_FORMAT_PRIORITY,
         )
         progress = self._make_progress_logger(track.track_id, on_stage=on_stage)
 
@@ -703,7 +769,8 @@ class SpotifyProvider(Provider):
         # at the source bitrate (lossy→lossy at 320 is inaudible for typical
         # material; 160/96 sources match their source rate to avoid wasting
         # space).
-        from core.audio_convert import transcode_to_mp3, ffmpeg_available
+        from core.audio_convert import ffmpeg_available, transcode_to_mp3
+
         ext = file_path.rsplit(".", 1)[-1].lower()
         if ext == "ogg" and ffmpeg_available():
             target_kbps = 320
@@ -713,7 +780,8 @@ class SpotifyProvider(Provider):
                 except ValueError:
                     pass
             mp3_path = await transcode_to_mp3(
-                file_path, bitrate_kbps=target_kbps,
+                file_path,
+                bitrate_kbps=target_kbps,
             )
             if mp3_path is not None and mp3_path.is_file():
                 file_path = str(mp3_path)
@@ -755,19 +823,24 @@ class SpotifyProvider(Provider):
         if len(sp_artists_all) > 1:
             new_extra["all_artists"] = [a.name for a in sp_artists_all]
 
-        merged = track.model_copy(update={
-            "title": st.name or track.title,
-            "artists": sp_artists,
-            "album": (st.album.name if st.album else None) or track.album,
-            "duration_seconds": (st.duration_ms // 1000) or track.duration_seconds,
-            "artwork_url": (st.album.cover_url if st.album else None) or track.artwork_url,
-            "isrc": st.isrc or track.isrc,
-            "extra": new_extra,
-        })
+        merged = track.model_copy(
+            update={
+                "title": st.name or track.title,
+                "artists": sp_artists,
+                "album": (st.album.name if st.album else None) or track.album,
+                "duration_seconds": (st.duration_ms // 1000) or track.duration_seconds,
+                "artwork_url": (st.album.cover_url if st.album else None)
+                or track.artwork_url,
+                "isrc": st.isrc or track.isrc,
+                "extra": new_extra,
+            }
+        )
 
         _log.info(
             "[spotify:{}] download complete: {} ({}, {:.2f} MiB)",
-            track.track_id, Path(file_path).name, format_name,
+            track.track_id,
+            Path(file_path).name,
+            format_name,
             size_bytes / 1048576,
         )
         return DownloadResult(
