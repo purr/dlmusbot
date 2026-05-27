@@ -36,7 +36,7 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InputTextMessageContent,
 )
-from loguru import logger
+from loguru import logger as _logger
 
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError, TrackNotFoundError
@@ -55,6 +55,10 @@ from ..ui import (
     format_track_caption,
     visible_help_providers,
 )
+
+# `.opt(colors=True)` enables inline markup parsing (`<cyan>...</cyan>`)
+# inside log messages — without it the tags are emitted literally.
+logger = _logger.opt(colors=True)
 
 router = Router(name="inline")
 
@@ -578,12 +582,31 @@ async def on_inline_query(
     inline_cache_s = max(0, int(getattr(config, "INLINE_CACHE_SECONDS", 60 * 60)))
 
     text = (query.query or "").strip()
-    logger.info(
-        "<cyan>[inline]</cyan> user={} query={!r} providers={}",
-        query.from_user.id if query.from_user else "?",
-        text,
-        ",".join(inline_search_providers),
-    )
+    # Detect URL vs. free-text up front so the start-log accurately
+    # reflects which path the query will actually take. URL queries
+    # only ever hit the resolver for the matching provider — listing
+    # the configured search providers there was misleading (made it
+    # look like SoundCloud was being queried for a Spotify URL).
+    url_provider = None
+    if text:
+        for p in registry.all():
+            if p.parse_url(text):
+                url_provider = p.name
+                break
+    if url_provider:
+        logger.info(
+            "<cyan>[inline]</cyan> user={} url={!r} <magenta>resolver={}</magenta>",
+            query.from_user.id if query.from_user else "?",
+            text,
+            url_provider,
+        )
+    else:
+        logger.info(
+            "<cyan>[inline]</cyan> user={} query={!r} providers={}",
+            query.from_user.id if query.from_user else "?",
+            text,
+            ",".join(inline_search_providers),
+        )
     if not text:
         visible = visible_help_providers(registry, config)
         await query.answer(
@@ -641,7 +664,7 @@ async def on_inline_query(
         # itself failed (token rotation, AP socket drop, region lock,
         # ...). Surface as a retry-friendly hint instead of pretending
         # the URL is unsupported.
-        switch_pm_text = "⚠️ Couldn't load that link"
+        switch_pm_text = "⚠️ Please try again later"
     elif mode == "track_not_found":
         switch_pm_text = "❌ Track ID not found"
     elif mode == "goplus_blocked":
@@ -665,9 +688,16 @@ async def on_inline_query(
     else:
         switch_pm_text = f"Found {total} tracks"
 
+    # Free-text search results are safe to cache — same query, same
+    # results within a reasonable window. URL pastes (`single`, playlist,
+    # artist) and any URL-resolution failure must NOT cache: if Spotify's
+    # cold-start handshake stalled the first attempt, Telegram would
+    # otherwise keep serving the empty/error response when the user
+    # retypes the same URL.
+    is_url_mode = mode != "search"
     answer_kwargs: dict = {
         "results": results,
-        "cache_time": inline_cache_s,
+        "cache_time": 0 if is_url_mode else inline_cache_s,
         "is_personal": True,
     }
     if switch_pm_text is not None:
