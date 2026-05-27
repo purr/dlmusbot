@@ -10,6 +10,12 @@ mutagen
 loguru
 Pillow
 cryptography
+# curl_cffi provides browser-impersonated HTTP for the SoundCloud
+# homepage scrape (AWS WAF blocks aiohttp's TLS fingerprint).
+curl_cffi
+# colorama enables ANSI escape sequences on Windows PowerShell / CMD
+# so loguru's coloured log output actually renders.
+colorama
 
 # Spotify downloader transitive (already vendored from spotify_test/libs):
 #   pefile, unicorn, rich, markdown_it, mdurl, pygments, idna, multidict,
