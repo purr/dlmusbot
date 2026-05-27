@@ -54,6 +54,14 @@ class Provider(abc.ABC):
     async def close(self) -> None:
         """Called once on bot shutdown. Release sockets."""
 
+    async def warmup(self) -> None:
+        """Optional cold-start primer. Called from a background task after
+        `start_all()` returns, so the bot can begin polling immediately
+        without waiting on slow auth handshakes. Implementations should
+        do whatever the first user request would otherwise pay for
+        (mint tokens, fetch rotating ids, open long-lived sessions).
+        Errors are swallowed by the caller — never block startup."""
+
     # ---- url plumbing -----------------------------------------------------
 
     def parse_url(self, text: str) -> Optional[URLMatch]:

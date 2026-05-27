@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -38,6 +39,38 @@ async def run(cfg: Any) -> None:
             "no providers registered — set SP_DC and/or check logs above"
         )
     await registry.start_all()
+    # Block startup until every provider has minted its tokens / scraped
+    # its client_id. Polling does NOT begin until this finishes, so the
+    # very first inline query — including a Spotify URL paste — already
+    # has a hot Spotify session and answers inside Telegram's ~10s
+    # inline_query window. Trade-off: ~5-40s slower cold start, but the
+    # user never sees an empty result on the first paste after restart.
+    # Upper bound on warmup. A hung TCP connect to Spotify AP or the
+    # SoundCloud homepage scrape could otherwise pin startup forever.
+    # 60s is generous (Spotify TOTP+AP typically completes in <40s);
+    # past that we accept that the first user query may still pay the
+    # cold-start tax rather than block polling indefinitely.
+    log.info("warming providers up before polling starts...")
+    try:
+        results = await asyncio.wait_for(
+            registry.warmup_all(), timeout=60.0,
+        )
+        summary = ", ".join(
+            f"{name}={state.split(':', 1)[0]}"
+            for name, state in results.items()
+        )
+        log.info("warmup status: %s", summary)
+        # If a provider warmed up dirty, surface it loudly so the
+        # operator knows their first query may suffer (and what to
+        # check — usually a network/auth issue).
+        for name, state in results.items():
+            if not state.startswith("ok"):
+                log.warning("provider '%s' is NOT hot: %s", name, state)
+    except asyncio.TimeoutError:
+        log.warning(
+            "provider warmup exceeded 60s; starting polling anyway "
+            "(first query may pay cold-start latency)"
+        )
 
     cache = FileIdCache(cfg.CACHE_FILE)
     stats_file = getattr(cfg, "STATS_FILE", "") or "data/bot_stats.json"

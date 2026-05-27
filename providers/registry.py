@@ -36,6 +36,28 @@ class Registry:
             except Exception:
                 log.exception("provider %s failed to start", p.name)
 
+    async def warmup_all(self) -> dict[str, str]:
+        """Run every provider's warmup() concurrently. Returns a
+        `{provider_name: "ok" | "failed: <reason>"}` map so the caller
+        can surface per-provider status accurately (the previous
+        "warmup complete" log lied when a single provider failed).
+        Failures are swallowed per-provider so one slow handshake
+        never blocks the others."""
+        import asyncio
+
+        results: dict[str, str] = {}
+
+        async def _one(p: Provider) -> None:
+            try:
+                await p.warmup()
+                results[p.name] = "ok"
+            except Exception as e:
+                results[p.name] = f"failed: {type(e).__name__}: {e}"
+                log.warning("provider %s warmup failed: %s", p.name, e)
+
+        await asyncio.gather(*(_one(p) for p in self._by_name.values()))
+        return results
+
     async def close_all(self) -> None:
         for p in self._by_name.values():
             try:
