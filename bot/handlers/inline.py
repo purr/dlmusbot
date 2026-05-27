@@ -41,7 +41,7 @@ from loguru import logger
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError, TrackNotFoundError
 from core.fallback import FALLBACK_REASONS, find_alternative_track
-from core.fuzz import dedupe_tracks, rank_balanced
+from core.fuzz import dedupe_near_duplicates, dedupe_tracks, rank_balanced
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
 from core.url_parser import parse as parse_url
@@ -485,15 +485,26 @@ async def _build_results(
     bundles = await asyncio.gather(*tasks)
     merged: list[Track] = [t for bundle in bundles for t in bundle]
     total_found = sum(len(bundle) for bundle in bundles)
-    # Drop cross-provider duplicates (same artist+title) — prefer Spotify
-    # since its metadata is more authoritative — then interleave by
-    # provider so neither catalogue monopolises the list when one
-    # provider's titles happen to score systematically higher.
+    # Two-pass dedupe — first catches exact (artist, title) duplicates,
+    # second catches near-duplicates (same artist + duration, fuzzy
+    # title overlap) like a SoundCloud re-upload of a Spotify track
+    # with uploader noise tacked on ("(MV IN DESC)" etc). Both prefer
+    # Spotify since its metadata is more authoritative.
     deduped = dedupe_tracks(merged)
+    deduped = dedupe_near_duplicates(deduped)
     ranked = rank_balanced(query, deduped, limit=limit)
     if not ranked and merged:
-        # Safety net: if dedupe/ranking ever collapses unexpectedly,
-        # still return visible results instead of an empty inline list.
+        # Observability: providers returned hits but our scorer dropped
+        # everything below `min_score`. That's the exact pathology of
+        # the "user types 'X' and sees nothing matching X" bug — log it
+        # at WARNING so it surfaces in production before users report.
+        # Then fall back to the raw merged list rather than ship an
+        # empty inline answer.
+        logger.warning(
+            "search drop-everything: query={!r} providers_returned={} dedup={} "
+            "ranked=0 — falling back to raw merge",
+            query, total_found, len(deduped),
+        )
         ranked = merged[:limit]
     # `total` is the raw summed provider count for the header text:
     # "Found X tracks" should reflect all provider hits together.
