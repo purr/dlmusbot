@@ -9,16 +9,30 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
+from core import disk_cache
 from core.exceptions import ProviderError, TrackNotFoundError
 from core.http_retry import get_with_retry
 
 API_V2 = "https://api-v2.soundcloud.com"
 HOMEPAGE = "https://soundcloud.com/discover"
+
+# Persist scraped client_id between runs. SoundCloud rotates the public
+# id rarely (weeks-to-months), so caching for 7 days + lazy-refresh on
+# 401 keeps the bot fast and cuts churn against the homepage (which is
+# AWS-WAF-fronted and intermittently serves 202 to bot-shaped UAs).
+# Path is anchored relative to the repo root (this file's grandparent's
+# parent), NOT cwd — so a different working directory (cron, systemd
+# WorkingDirectory unset, pm2 with non-default cwd) can't silently
+# scatter cache files across the filesystem.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CID_CACHE_PATH = _REPO_ROOT / "data" / "soundcloud_client_id.json"
+_CID_CACHE_TTL_S = 7 * 24 * 3600
 
 _CLIENT_ID_RE = re.compile(r'client_id\s*[:=]\s*["\']([A-Za-z0-9]{20,40})["\']')
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]+src="([^"]+\.js[^"]*)"', re.I)
@@ -35,6 +49,29 @@ DEFAULT_HEADERS = {
 }
 
 log = logging.getLogger(__name__)
+
+
+_CID_VALID_RE = re.compile(r"[A-Za-z0-9]{20,40}")
+
+
+def _is_valid_client_id(cid: Any) -> bool:
+    return isinstance(cid, str) and bool(_CID_VALID_RE.fullmatch(cid))
+
+
+def _load_cached_client_id() -> tuple[Optional[str], bool]:
+    """Returns (client_id_or_None, is_fresh) via the shared disk_cache
+    helper. Validates against the SoundCloud public-id charset so a
+    corrupted file can't ship garbage strings into every API request."""
+    return disk_cache.load(
+        _CID_CACHE_PATH,
+        value_key="client_id",
+        ttl_seconds=_CID_CACHE_TTL_S,
+        validator=_is_valid_client_id,
+    )
+
+
+def _save_cached_client_id(cid: str) -> None:
+    disk_cache.save(_CID_CACHE_PATH, value_key="client_id", value=cid)
 
 
 def _normalize_resolve_url(url: str) -> str:
@@ -60,37 +97,123 @@ def _normalize_resolve_url(url: str) -> str:
     return urlunparse(parts._replace(path=path))
 
 
-async def _probe_script_for_client_id(
-    http: aiohttp.ClientSession, url: str
+# Browser impersonation profile for the Cloudflare-fronted endpoints.
+# `aiohttp`'s TLS handshake doesn't match real Chrome — Cloudflare reads
+# the JA3/JA4 fingerprint and serves 202 (or 403) to anything that
+# doesn't look like a real browser. `curl_cffi` wraps libcurl-impersonate
+# and reproduces Chrome's exact TLS ClientHello + HTTP/2 settings, so
+# our requests are indistinguishable from a browser at the network
+# level. Used ONLY for the homepage scrape (the Cloudflare wall);
+# api-v2 endpoints don't need it and stay on the cheap aiohttp path.
+_BROWSER_IMPERSONATE = "chrome131"
+
+
+async def _probe_script_for_client_id_browserlike(
+    session, url: str,
 ) -> Optional[str]:
+    """Browser-impersonated GET on a JS bundle URL using the *shared*
+    AsyncSession opened by `fetch_client_id`. Returns the client_id
+    literal if found, else None. Sharing the session avoids paying a
+    fresh TLS handshake per script URL — a 9-script homepage previously
+    paid 9× the impersonation cost plus risked hitting AWS WAF's
+    burst-rate trigger."""
     try:
-        async with http.get(url, headers=DEFAULT_HEADERS) as r:
-            if r.status != 200:
-                return None
-            body = await r.text()
-    except aiohttp.ClientError:
+        r = await session.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        body = r.text
+    except Exception as e:
+        log.debug("soundcloud script probe failed for %s: %s", url, e)
         return None
     m = _CLIENT_ID_RE.search(body)
     return m.group(1) if m else None
 
 
-async def fetch_client_id(http: aiohttp.ClientSession) -> str:
-    """Scrape a working client_id from one of soundcloud.com's JS bundles."""
-    async with http.get(HOMEPAGE, headers=DEFAULT_HEADERS) as r:
-        if r.status != 200:
-            raise ProviderError(f"soundcloud homepage {r.status}")
-        html = await r.text()
+# AWS WAF backoff schedule. SoundCloud sits behind AWS WAF which
+# rate-triggers a 202 "Just a moment..." JS challenge under bursty
+# load. The challenge typically clears within 10-30s; these waits
+# give it room to relax without making the operator stare at logs.
+_WAF_RETRY_WAITS_S: tuple[float, ...] = (8.0, 15.0, 25.0)
 
-    for src in _SCRIPT_SRC_RE.findall(html):
-        cid = await _probe_script_for_client_id(http, src)
-        if cid:
-            return cid
+
+async def fetch_client_id(http: aiohttp.ClientSession) -> str:
+    """Scrape a working client_id from one of soundcloud.com's JS bundles.
+
+    Uses `curl_cffi` to impersonate a real Chrome TLS handshake — the
+    aiohttp/Python TLS fingerprint trips AWS WAF's bot wall and gets
+    served a 202 JS challenge instead of the real homepage. The
+    `http` parameter is kept in the signature for backward-
+    compatibility but is intentionally not used here.
+
+    If the WAF *is* in challenge mode (rate-triggered, transient),
+    we retry up to len(_WAF_RETRY_WAITS_S) times with growing waits.
+    """
+    del http  # browser-impersonated session is opened internally
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError as e:
+        raise ProviderError(
+            f"curl_cffi not installed — needed for soundcloud "
+            f"homepage scrape (AWS WAF bot wall): {e}"
+        ) from e
+
+    # Single AsyncSession reused for the homepage fetch + every script
+    # probe. New session per probe was paying a TLS handshake per call
+    # and risked AWS WAF's burst-rate trigger.
+    async with AsyncSession(impersonate=_BROWSER_IMPERSONATE) as s:
+        html: Optional[str] = None
+        for attempt, wait_s in enumerate(_WAF_RETRY_WAITS_S, start=1):
+            try:
+                r = await s.get(HOMEPAGE, timeout=10)
+            except Exception as e:
+                raise ProviderError(
+                    f"soundcloud homepage fetch failed: {e}"
+                ) from e
+            if r.status_code == 200:
+                html = r.text
+                break
+            if r.status_code == 202:
+                log.warning(
+                    "soundcloud WAF challenge (attempt %d/%d, waiting "
+                    "%.0fs before retry)",
+                    attempt, len(_WAF_RETRY_WAITS_S), wait_s,
+                )
+                if attempt < len(_WAF_RETRY_WAITS_S):
+                    await asyncio.sleep(wait_s)
+                continue
+            raise ProviderError(
+                f"soundcloud homepage {r.status_code} "
+                f"(unexpected status with {_BROWSER_IMPERSONATE} "
+                f"impersonation)"
+            )
+        if html is None:
+            raise ProviderError(
+                f"soundcloud WAF stayed in challenge mode across "
+                f"{len(_WAF_RETRY_WAITS_S)} attempts"
+            )
+
+        for src in _SCRIPT_SRC_RE.findall(html):
+            cid = await _probe_script_for_client_id_browserlike(s, src)
+            if cid:
+                return cid
 
     raise ProviderError("could not extract SoundCloud client_id from homepage")
 
 
 class SoundCloudAPI:
     def __init__(self, client_id: Optional[str] = None):
+        # Prefer caller-supplied id; otherwise load from disk so a
+        # fresh process boot doesn't need to scrape the homepage at
+        # all. Stale-cache fallback is handled by the same load fn.
+        if not client_id:
+            cached, fresh = _load_cached_client_id()
+            if cached:
+                client_id = cached
+                log.info(
+                    "soundcloud client_id loaded from disk cache "
+                    "(%s)",
+                    "fresh" if fresh else "stale — will refresh on 401",
+                )
         self._client_id = client_id
         self._http: Optional[aiohttp.ClientSession] = None
         self._cid_lock = asyncio.Lock()
@@ -112,14 +235,36 @@ class SoundCloudAPI:
         assert self._http is not None, "SoundCloudAPI not started"
         return self._http
 
+    async def ensure_client_id(self, force: bool = False) -> str:
+        """Return the cached public client_id, scraping one on first call.
+        Pass `force=True` after a 401 to invalidate + refetch."""
+        return await self._ensure_client_id(force=force)
+
     async def _ensure_client_id(self, force: bool = False) -> str:
         if self._client_id and not force:
             return self._client_id
         async with self._cid_lock:
             if self._client_id and not force:
                 return self._client_id
-            self._client_id = await fetch_client_id(self.http)
-            log.info("soundcloud client_id refreshed")
+            # Remember the existing (possibly soon-stale) id so we can
+            # fall back to it if the scrape fails. Cloudflare often
+            # responds 202 to bot-shaped User-Agents; a 7-day-old
+            # client_id almost always still works.
+            previous = self._client_id
+            try:
+                self._client_id = await fetch_client_id(self.http)
+                _save_cached_client_id(self._client_id)
+                log.info("soundcloud client_id refreshed + cached to disk")
+            except ProviderError as e:
+                if previous:
+                    log.warning(
+                        "soundcloud client_id refresh failed (%s); "
+                        "continuing with previous id",
+                        e,
+                    )
+                    self._client_id = previous
+                else:
+                    raise
             return self._client_id
 
     async def _get_json(

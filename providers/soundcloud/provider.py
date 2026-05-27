@@ -331,6 +331,21 @@ class SoundCloudProvider(Provider):
     async def close(self) -> None:
         await self._api.close()
 
+    async def warmup(self) -> None:
+        """Pre-fetch the public client_id ONLY if we don't already have
+        one cached on disk. SoundCloud's homepage is Cloudflare-fronted
+        and occasionally serves 202 to bot-shaped User-Agents — when
+        that happens the cached id (from a previous successful scrape)
+        is what keeps the bot working. The next genuine 401 from the
+        API triggers a real refresh via `_ensure_client_id(force=True)`,
+        so a stale id self-heals on demand."""
+        if self._api._client_id:
+            log.debug(
+                "soundcloud: using cached client_id, skipping warmup probe"
+            )
+            return
+        await self._api.ensure_client_id()
+
     @property
     def api(self) -> SoundCloudAPI:
         return self._api
