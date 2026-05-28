@@ -39,7 +39,12 @@ from aiogram.types import (
 from core.cache import FileIdCache
 from core.exceptions import DlmusError, ProviderError, TrackNotFoundError
 from core.fallback import FALLBACK_REASONS, find_alternative_track
-from core.fuzz import dedupe_near_duplicates, dedupe_tracks, rank_balanced
+from core.fuzz import (
+    dedupe_embedded_title,
+    dedupe_near_duplicates,
+    dedupe_tracks,
+    rank_balanced,
+)
 from core.logging_setup import logger
 from core.models import Track
 from core.shortlink import resolve as resolve_short_url
@@ -484,13 +489,17 @@ async def _build_results(
     bundles = await asyncio.gather(*tasks)
     merged: list[Track] = [t for bundle in bundles for t in bundle]
     total_found = sum(len(bundle) for bundle in bundles)
-    # Two-pass dedupe — first catches exact (artist, title) duplicates,
+    # Three-pass dedupe — first catches exact (artist, title) duplicates;
     # second catches near-duplicates (same artist + duration, fuzzy
-    # title overlap) like a SoundCloud re-upload of a Spotify track
-    # with uploader noise tacked on ("(MV IN DESC)" etc). Both prefer
+    # title overlap) like a SoundCloud re-upload of a Spotify track with
+    # uploader noise tacked on ("(MV IN DESC)" etc); third catches
+    # re-uploads whose ARTIST field differs (uploader name) but whose
+    # TITLE embeds the Spotify artist+song at the same duration
+    # ("GIORGI SANIKIDZE — Psychonaut 4 - Suicide Is Legal"). All prefer
     # Spotify since its metadata is more authoritative.
     deduped = dedupe_tracks(merged)
     deduped = dedupe_near_duplicates(deduped)
+    deduped = dedupe_embedded_title(deduped)
     ranked = rank_balanced(query, deduped, limit=limit)
     if not ranked and merged:
         # Observability: providers returned hits but our scorer dropped

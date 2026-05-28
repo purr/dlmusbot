@@ -135,41 +135,86 @@ _FUZZY_TOKEN_RATIO_THRESHOLD = 85
 _PARTIAL_MATCH_WEIGHT = 0.5
 
 
-def _coverage(query_tokens: set[str], haystack_tokens: set[str]) -> float:
-    """Weighted fraction of query tokens present in the haystack.
+def _match_weight(
+    needle: str, haystack_tokens: set[str], *, allow_fuzzy: bool = True,
+) -> float:
+    """Weight a single string earns against the haystack token set:
+      * `1.0`  — exact: `needle` is one of the haystack tokens.
+      * `0.5`  — `needle` (len ≥ 4) is a substring of some haystack token,
+                 OR (when `allow_fuzzy`) fuzzy-matches one at `ratio ≥ 85`.
+      * `0.0`  — no match (or too short for the partial tiers).
 
-    A query token contributes to coverage by match tier:
-      1. **Exact** (`+1.0`) — `"bladee"` is in haystack tokens.
-      2. **Substring** (`+_PARTIAL_MATCH_WEIGHT`) — `"fake"` is contained
-         in `"fakemink"`. Gated at `len >= 4` so 3-char queries like
-         `"rap"` don't cross-match `"rapture"`.
-      3. **Fuzzy near-match** (`+_PARTIAL_MATCH_WEIGHT`) — some haystack
-         token has `fuzz.ratio(qt, ht) >= 85`. Catches typo / spelling-
-         variant pairs like `"unlovable"` ↔ `"unloveable"`. Same gate.
+    The `len >= 4` gate on the partial tiers is what stops a 3-char query
+    like `"rap"` from cross-matching `"rapture"` / `"rapid"`.
 
-    Returned value is `sum_of_weights / len(query_tokens)`, in [0, 1].
-    Exact matches win cleanly; partial matches keep typo/compound-word
-    queries alive but never tie with exact hits.
-    """
-    if not query_tokens:
+    `allow_fuzzy=False` is used by the consecutive-merge pass: concatenating
+    an already-exact token with a short neighbour ("buckshot"+"fe") produces
+    a string that fuzzy-matches the exact token itself (`ratio ~89`), which
+    would leak partial credit onto the fragment. Exact + substring only on
+    merges sidesteps that — a split word still recovers via its exact join
+    ("fe"+"ver" = "fever")."""
+    if needle in haystack_tokens:
+        return 1.0
+    if len(needle) < _FUZZY_TOKEN_MIN_LEN:
         return 0.0
-    weight_sum = 0.0
-    for qt in query_tokens:
-        if qt in haystack_tokens:
-            weight_sum += 1.0
-            continue
-        if len(qt) < _FUZZY_TOKEN_MIN_LEN:
-            continue
-        if any(qt in ht for ht in haystack_tokens):
-            weight_sum += _PARTIAL_MATCH_WEIGHT
-            continue
-        if any(
-            fuzz.ratio(qt, ht) >= _FUZZY_TOKEN_RATIO_THRESHOLD
-            for ht in haystack_tokens
-            if len(ht) >= _FUZZY_TOKEN_MIN_LEN
-        ):
-            weight_sum += _PARTIAL_MATCH_WEIGHT
-    return weight_sum / len(query_tokens)
+    if any(needle in ht for ht in haystack_tokens):
+        return _PARTIAL_MATCH_WEIGHT
+    if allow_fuzzy and any(
+        fuzz.ratio(needle, ht) >= _FUZZY_TOKEN_RATIO_THRESHOLD
+        for ht in haystack_tokens
+        if len(ht) >= _FUZZY_TOKEN_MIN_LEN
+    ):
+        return _PARTIAL_MATCH_WEIGHT
+    return 0.0
+
+
+def _coverage(query_tokens, haystack_tokens: set[str]) -> float:
+    """Weighted fraction of query tokens present in the haystack, in [0, 1].
+
+    Each query token earns a weight via `_match_weight` (exact `1.0`,
+    substring / fuzzy `0.5`). On top of that, a **consecutive-merge** pass
+    handles the case where a user split one word across spaces: the query
+    `"fe ver"` should match the haystack token `"fever"`. For every run of
+    adjacent query tokens we concatenate them and, when the joined string
+    matches a haystack token, upgrade each constituent token's weight to
+    that match's weight (taking the max, so a merge can only ever help).
+
+    `"buckshot fe ver fak"` against `"buckshot fakemink fever"`:
+      * per-token — `buckshot` exact (`1.0`); `fe` / `ver` / `fak` too
+        short to match anything → `0.0` each.
+      * merge — `"fe"+"ver"` = `"fever"`, an exact haystack token, so `fe`
+        and `ver` are upgraded to `1.0`.
+      * result — `(1 + 1 + 1 + 0) / 4 = 0.75`, enough to lift the real
+        "Fever" hit above unrelated "Buckshot …" tracks that only cover
+        the single `buckshot` token.
+
+    `query_tokens` must be an ordered sequence (the merge pass relies on
+    adjacency); `score` passes the de-duplicated query tokens in order.
+    The denominator is the token count, so the merge never inflates
+    coverage past 1.0.
+    """
+    qt_list = list(query_tokens)
+    n = len(qt_list)
+    if n == 0:
+        return 0.0
+
+    weights = [_match_weight(qt, haystack_tokens) for qt in qt_list]
+
+    # Consecutive-merge pass — only meaningful for multi-token queries.
+    # Window length capped implicitly by the query size (always small).
+    for i in range(n):
+        for j in range(i + 1, n):
+            concat = "".join(qt_list[i : j + 1])
+            if len(concat) < _FUZZY_TOKEN_MIN_LEN:
+                continue
+            w = _match_weight(concat, haystack_tokens, allow_fuzzy=False)
+            if w <= 0.0:
+                continue
+            for k in range(i, j + 1):
+                if w > weights[k]:
+                    weights[k] = w
+
+    return sum(weights) / n
 
 
 def score(query: str, track: Track) -> float:
@@ -220,7 +265,11 @@ def score(query: str, track: Track) -> float:
     # tokens get squashed proportionally; a single-token typo with no
     # token overlap (e.g. "feever" vs "Fever") survives at 0.5*base so
     # the obvious target isn't nuked from the result set entirely.
-    q_tok = _tokens(q)
+    # Ordered, de-duplicated query tokens — order matters for the
+    # consecutive-merge pass in `_coverage` (split-word recovery), and
+    # de-duplication keeps the denominator equal to the distinct-token
+    # count so repeats ("la la la") don't dilute coverage.
+    q_tok = list(dict.fromkeys(_TOKEN_RE.findall(q)))
     coverage = _coverage(q_tok, _tokens(combined))
     return base * (0.5 + 0.5 * coverage)
 
@@ -273,6 +322,15 @@ def dedupe_tracks(
 # genuinely different tracks together.
 _NEAR_DUP_DURATION_TOL_S = 2
 _NEAR_DUP_TITLE_RATIO = 80
+
+# Guards for `dedupe_embedded_title`. The embedded-title heuristic is
+# strong (it needs the authoritative track's artist AND title to both
+# appear verbatim inside the other track's title, at the same duration),
+# but a 1-2 char artist or title could coincidentally substring-match an
+# unrelated track that happens to share a runtime. Require a little
+# substance on both before trusting the match.
+_EMBED_MIN_ARTIST_LEN = 2
+_EMBED_MIN_TITLE_LEN = 3
 
 
 def _primary_artist_clean(t: Track) -> str:
@@ -358,6 +416,93 @@ def dedupe_near_duplicates(
             else:
                 keep[i] = False
                 break
+    return [t for t, k in zip(track_list, keep) if k]
+
+
+def _title_embeds_track(reup_title_clean: str, authoritative: Track) -> bool:
+    """True when `authoritative`'s primary artist AND title both appear,
+    verbatim, inside `reup_title_clean` (an already-`_clean`'d title).
+
+    Models the common SoundCloud re-upload shape: a Spotify single
+    "Psychonaut 4 — Suicide Is Legal" re-posted by some random uploader
+    as a track titled "Psychonaut 4 - Suicide Is Legal" (uploader name in
+    the artist field, original artist + song folded into the title). The
+    same-artist near-dup pass misses these because the artist field no
+    longer matches; this catches them by the title fingerprint instead.
+
+    Kept dynamic — no hard-coded names. Both fields must clear a minimum
+    length so a trivially-short artist/title can't coincidentally match.
+    """
+    artist = _primary_artist_clean(authoritative)
+    title = _clean(authoritative.title)
+    if len(artist) < _EMBED_MIN_ARTIST_LEN or len(title) < _EMBED_MIN_TITLE_LEN:
+        return False
+    return artist in reup_title_clean and title in reup_title_clean
+
+
+def dedupe_embedded_title(
+    tracks: Iterable[Track],
+    *, prefer: tuple[str, ...] = ("spotify", "soundcloud", "youtube_music"),
+    duration_tolerance_s: int = _NEAR_DUP_DURATION_TOL_S,
+) -> list[Track]:
+    """Third-pass dedupe for cross-provider re-uploads whose ARTIST field
+    differs but whose TITLE embeds the authoritative track's artist+song.
+
+    Two tracks collapse when ALL of:
+      * Both report a non-zero duration differing by ≤ `duration_tolerance_s`.
+      * They come from different-priority providers (so one is clearly the
+        authoritative source — Spotify over SoundCloud over YT Music).
+      * The lower-priority track's cleaned title contains BOTH the
+        higher-priority track's cleaned primary-artist name and its
+        cleaned title (see `_title_embeds_track`).
+
+    The authoritative (higher-priority) track is always kept; the
+    re-upload is dropped. Order is preserved among survivors.
+
+    Real case this catches that `dedupe_near_duplicates` cannot: Spotify
+    "Psychonaut 4 — Suicide Is Legal" (388s) and SoundCloud
+    "GIORGI SANIKIDZE — Psychonaut 4 - Suicide Is Legal" (388s). The
+    artist fields differ, so the same-artist pass keeps both; here the SC
+    title fingerprint matches the Spotify artist+title and the SC copy is
+    dropped in favour of Spotify.
+    """
+    track_list = list(tracks)
+    if len(track_list) < 2:
+        return track_list
+
+    rank_by_provider = {p: i for i, p in enumerate(prefer)}
+    fallback_rank = len(prefer)
+    keep = [True] * len(track_list)
+
+    for i in range(len(track_list)):
+        if not keep[i]:
+            continue
+        ti = track_list[i]
+        ti_dur = ti.duration_seconds
+        if ti_dur <= 0:
+            continue
+        pi = rank_by_provider.get(ti.provider, fallback_rank)
+        for j in range(i + 1, len(track_list)):
+            if not keep[j]:
+                continue
+            tj = track_list[j]
+            if tj.duration_seconds <= 0:
+                continue
+            if abs(ti_dur - tj.duration_seconds) > duration_tolerance_s:
+                continue
+            pj = rank_by_provider.get(tj.provider, fallback_rank)
+            if pi == pj:
+                # Same provider tier — neither is the authoritative source,
+                # so the "prefer Spotify" direction is undefined. Skip.
+                continue
+            if pi < pj:
+                keeper, reup, reup_idx = ti, tj, j
+            else:
+                keeper, reup, reup_idx = tj, ti, i
+            if _title_embeds_track(_clean(reup.title), keeper):
+                keep[reup_idx] = False
+                if reup_idx == i:
+                    break
     return [t for t, k in zip(track_list, keep) if k]
 
 
