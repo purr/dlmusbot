@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
@@ -20,7 +21,12 @@ from ..base import Provider, StageCallback
 from . import search as search_mod
 from ._internal import SpotifyDownloaderError, download_track_with_session
 from ._internal import api as api_mod
-from ._internal.auth import DEFAULT_HEADERS, HTTP_TIMEOUT, get_access_token
+from ._internal.auth import (
+    DEFAULT_HEADERS,
+    HTTP_TIMEOUT,
+    get_access_token,
+    get_client_token,
+)
 from ._internal.exceptions import (
     HandshakeError,
     LoginError,
@@ -61,6 +67,10 @@ TOKEN_TTL_SECONDS = 50 * 60
 # Safety window — refresh the token this many seconds *before* its declared
 # expiry so we don't ship a token that dies mid-request on the wire.
 TOKEN_REFRESH_LEEWAY_S = 60
+
+# Same idea for the pathfinder client-token. Spotify hands these out with a
+# multi-day lifetime, so a few minutes of leeway is plenty.
+CLIENT_TOKEN_REFRESH_LEEWAY_S = 300
 
 # Audio formats we'll ask librespot for, ordered highest-quality-first.
 # Only OGG_VORBIS variants are listed because they're the only librespot-
@@ -224,6 +234,16 @@ class SpotifyProvider(Provider):
         # own /api/token request (and TOTP secret fetch), hammering Spotify
         # for nothing.
         self._token_lock = asyncio.Lock()
+        # client_id is reported by the /api/token response and is needed to
+        # mint the pathfinder client-token below.
+        self._client_id: Optional[str] = None
+        # pathfinder client-token (paired with the bearer on every GraphQL
+        # search). Cached with its own lock + expiry like the access token.
+        self._client_token_cached: Optional[str] = None
+        self._client_token_expires_at: float = 0.0
+        self._client_token_lock = asyncio.Lock()
+        # Stable per-process device id for the client-token handshake.
+        self._device_id = uuid.uuid4().hex
         # Long-lived librespot AP socket. Cached so we don't pay the DH+login
         # handshake (~hundreds of ms) on every track. Recreated lazily after
         # a connection drop or auth-token rotation.
@@ -258,9 +278,13 @@ class SpotifyProvider(Provider):
         t0 = time.time()
         await self._access_token()
         try:
+            await self._client_token()
+        except Exception as e:
+            _log.warning("[spotify] warmup client-token mint failed: {}", e)
+        try:
             await self._get_session()
         except Exception as e:
-            _log.warning("[spotify] warmup session open failed: %s", e)
+            _log.warning("[spotify] warmup session open failed: {}", e)
             return
         _log.info("[spotify] warmup complete ({:.2f}s)", time.time() - t0)
 
@@ -285,6 +309,9 @@ class SpotifyProvider(Provider):
             assert self._http is not None
             token_info = await get_access_token(self._sp_dc, session=self._http)
             self._token = token_info["accessToken"]
+            client_id = token_info.get("clientId")
+            if client_id:
+                self._client_id = client_id
             self._token_fetched_at = now
             expiry_ms = token_info.get("accessTokenExpirationTimestampMs")
             if isinstance(expiry_ms, (int, float)) and expiry_ms > 0:
@@ -314,6 +341,52 @@ class SpotifyProvider(Provider):
             log.info("spotify access token rejected (401), refreshing once")
             token = await self._access_token(force_refresh=True)
             return await fn(token)
+
+    async def _client_token(self, *, force_refresh: bool = False) -> str:
+        """Return a valid pathfinder client-token, minting one on first use
+        or after expiry. Required (with the bearer) by the searchDesktop
+        GraphQL call. Cached for its server-declared lifetime."""
+        now = time.time()
+        if (
+            not force_refresh
+            and self._client_token_cached
+            and now < self._client_token_expires_at
+        ):
+            return self._client_token_cached
+        async with self._client_token_lock:
+            now = time.time()
+            if (
+                not force_refresh
+                and self._client_token_cached
+                and now < self._client_token_expires_at
+            ):
+                return self._client_token_cached
+            # client_id is populated as a side effect of minting the access
+            # token — make sure we've done that at least once.
+            if not self._client_id:
+                await self._access_token()
+            if not self._client_id:
+                raise ProviderError(
+                    "spotify: no client_id available to mint client-token"
+                )
+            assert self._http is not None
+            granted = await get_client_token(
+                self._client_id, self._device_id, session=self._http,
+            )
+            self._client_token_cached = granted["token"]
+            ttl = (
+                granted.get("refresh_after_seconds")
+                or granted.get("expires_after_seconds")
+                or 3600
+            )
+            self._client_token_expires_at = (
+                now + max(60.0, float(ttl) - CLIENT_TOKEN_REFRESH_LEEWAY_S)
+            )
+            _log.info(
+                "[spotify] minted client-token (refresh in {:.0f}s)",
+                max(0.0, self._client_token_expires_at - now),
+            )
+            return self._client_token_cached
 
     # ---- session caching -------------------------------------------------
 
@@ -398,15 +471,34 @@ class SpotifyProvider(Provider):
 
     async def search(self, query: str, limit: int = 25) -> list[Track]:
         assert self._http is not None
-        try:
+
+        async def _run() -> list[Track]:
+            client_token = await self._client_token()
             return await self._with_token_retry(
                 lambda tok: search_mod.search_tracks(
                     self._http,
                     tok,
+                    client_token,
                     query,
                     limit,
                 )
             )
+
+        try:
+            return await _run()
+        except TokenExpiredError:
+            # A 401 that survived the in-retry bearer refresh is most likely
+            # a client-token revoked server-side before its declared expiry.
+            # Force-mint a fresh one and retry the whole call once.
+            log.info(
+                "spotify search still 401 after bearer refresh; "
+                "refreshing client-token"
+            )
+            try:
+                await self._client_token(force_refresh=True)
+                return await _run()
+            except SpotifyDownloaderError as e:
+                raise ProviderError(f"spotify search failed: {e}") from e
         except SpotifyDownloaderError as e:
             raise ProviderError(f"spotify search failed: {e}") from e
 

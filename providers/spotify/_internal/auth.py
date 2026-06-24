@@ -45,6 +45,13 @@ TOTP_SECRETS_URLS: tuple[str, ...] = (
 )
 SERVER_TIME_URL = "https://open.spotify.com/api/server-time"
 TOKEN_URL = "https://open.spotify.com/api/token"
+# Mints the `client-token` that the pathfinder GraphQL API requires
+# alongside the bearer token (mandatory since Spotify's Feb-2026 change).
+CLIENT_TOKEN_URL = "https://clienttoken.spotify.com/v1/clienttoken"
+
+# Web Player build string — sent as the client_version in the client-token
+# handshake. Kept loosely in sync with the Spotify-App-Version header below.
+APP_VERSION = "1.2.87.27.ga2033a72"
 
 TOTP_PERIOD = 30
 TOTP_DIGITS = 6
@@ -266,8 +273,61 @@ async def get_access_token(
             "spotify access-token minted in %.2fs", time.time() - t0,
         )
         if "accessToken" not in token:
-            raise AuthError(f"no accessToken in response: {token!r}")
+            keys = sorted(token.keys()) if isinstance(token, dict) else []
+            raise AuthError(f"no accessToken in response (keys={keys})")
         return token
     finally:
         if own_session:
             await session.close()
+
+
+async def get_client_token(
+    client_id: str,
+    device_id: str,
+    *,
+    session: aiohttp.ClientSession,
+) -> dict:
+    """Mint a `client-token` for the pathfinder GraphQL API.
+
+    Since the Feb-2026 API change, api-partner.spotify.com rejects requests
+    that carry only the bearer token — every call must also send a
+    `client-token` header. This POST handshake returns it. `client_id` comes
+    from the /api/token response (`clientId`); `device_id` is any stable
+    per-install hex string.
+
+    Returns the raw `granted_token` dict:
+        {token, expires_after_seconds, refresh_after_seconds}."""
+    if not client_id:
+        raise AuthError("client-token request needs a client_id")
+    body = {
+        "client_data": {
+            "client_id": client_id,
+            "client_version": APP_VERSION,
+            "js_sdk_data": {
+                "device_brand": "unknown",
+                "device_id": device_id,
+                "device_model": "unknown",
+                "device_name": "computer",
+                "os": "windows",
+                "os_version": "NT 10.0",
+            },
+        }
+    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    try:
+        async with session.post(
+            CLIENT_TOKEN_URL, json=body, headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                text = (await resp.text())[:300]
+                raise AuthError(f"clienttoken -> {resp.status}: {text}")
+            data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        raise AuthError(f"network error fetching client-token: {e}") from e
+    granted = (data or {}).get("granted_token") or {}
+    if not granted.get("token"):
+        # Never interpolate the raw body — it comes from the token-mint
+        # endpoint. Log only its shape for diagnosis.
+        keys = sorted(data.keys()) if isinstance(data, dict) else []
+        raise AuthError(f"no client-token in response (keys={keys})")
+    return granted

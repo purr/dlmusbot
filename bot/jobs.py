@@ -70,7 +70,7 @@ from .status import (
     stage_kb,
 )
 from .tagging import embed_metadata, fetch_cover, prepare_telegram_thumbnail
-from .ui import format_track_caption
+from .ui import esc, format_track_caption
 
 _KBPS_IN_FORMAT = _re_mod.compile(r"(\d{2,4})")
 
@@ -1086,7 +1086,9 @@ class JobRunner:
             if handle not in display_parts:
                 display_parts.append(handle)
         display = " ".join(display_parts).strip() or "unknown"
-        text = f"Requested by {display} ({user_id})"
+        # Bot default parse_mode is HTML, so a name containing '<' (e.g. "<3")
+        # would otherwise blow up as "can't parse entities".
+        text = f"Requested by {esc(display)} ({user_id})"
         try:
             await self._bot.send_message(
                 chat_id=self._forward_log_channel_id,
