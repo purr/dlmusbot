@@ -16,6 +16,32 @@ BOT_TOKEN: str = "123456:REPLACE_ME"
 FORWARD_LOG_CHANNEL_ID: str = ""
 
 
+# --- Cloud backup (cache + stats -> Telegram channel) ----------------------
+
+# Fully automatic. cache.json + bot_stats.json are continuously backed up to
+# a private Telegram channel and MERGED back in on every startup, so the data
+# survives a server switch or a wiped disk with zero manual steps. It turns
+# itself on as soon as a usable channel exists (this one, or a dedicated one
+# below) — no enable flag.
+#
+# Requirements for the channel:
+#   - PRIVATE (never public — the backup contains user IDs).
+#   - This bot is an ADMIN with "Post Messages" AND "Edit Messages" rights
+#     (channels require "Edit Messages" to pin; the normal pin right does not
+#     apply to channels). If the right is missing the backup quietly disables
+#     itself and logs why — nothing breaks.
+#   - Nothing else gets pinned there (the bot finds its backup via the pin).
+#
+# Only cache.json + stats are ever uploaded — never tokens/cookies/sp_dc.
+# Empty -> reuse FORWARD_LOG_CHANNEL_ID. Both empty -> backup off.
+BACKUP_CHANNEL_ID: str = ""
+BACKUP_INTERVAL_MINUTES: int = 10
+# How many recent backup archives to retain in the channel (older ones are
+# pruned only after a new one is safely uploaded + pinned).
+BACKUP_KEEP: int = 3
+BACKUP_STATE_FILE: str = "data/backup_state.json"
+
+
 # --- Spotify ---------------------------------------------------------------
 
 # `sp_dc` cookie value from open.spotify.com. Required for any Spotify use

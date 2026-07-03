@@ -16,6 +16,7 @@ from core.cache import FileIdCache
 from core.queue import DownloadQueue
 from providers.registry import build_default_registry
 
+from . import backup as backup_mod
 from .dm_probe import DMProbe
 from .flood import flood_control_middleware
 from .handlers import ROUTERS
@@ -72,8 +73,43 @@ async def run(cfg: Any) -> None:
             "(first query may pay cold-start latency)"
         )
 
-    cache = FileIdCache(cfg.CACHE_FILE)
+    # The Bot must exist before the cache/stats are loaded: the optional
+    # Telegram backup restore talks to Telegram AND may replace cache.json /
+    # bot_stats.json on disk, so it has to run first.
+    bot = Bot(
+        token=cfg.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
+    # Sits below every bot API call: waits out Telegram flood limits
+    # (TelegramRetryAfter) and retries, so throttling never crashes a job.
+    bot.session.middleware(flood_control_middleware)
+    me = await bot.get_me()
+    log.info("logged in as @%s (id=%s)", me.username, me.id)
+
     stats_file = getattr(cfg, "STATS_FILE", "") or "data/bot_stats.json"
+
+    # Automatic durable backup: before loading cache/stats, MERGE whatever is
+    # in the backup channel into the local files, so a fresh/switched server
+    # self-heals (and a partial local set gets topped up). Auto-on whenever a
+    # channel exists. Fully best-effort — never blocks or crashes startup.
+    backup_boot: dict = {}
+    backup_channel = (
+        getattr(cfg, "BACKUP_CHANNEL_ID", "")
+        or getattr(cfg, "FORWARD_LOG_CHANNEL_ID", "")
+    )
+    if backup_channel:
+        try:
+            backup_boot = await backup_mod.merge_on_boot(
+                bot,
+                channel_id=backup_channel,
+                cache_path=cfg.CACHE_FILE,
+                stats_path=stats_file,
+                me_id=me.id,
+            )
+        except Exception:
+            log.exception("[backup] merge-on-boot failed; continuing")
+
+    cache = FileIdCache(cfg.CACHE_FILE)
     bot_stats.configure(stats_file)
     await bot_stats.load()
     # Download concurrency: one worker per CPU core by default. A positive
@@ -88,16 +124,6 @@ async def run(cfg: Any) -> None:
     queue: DownloadQueue = DownloadQueue(concurrency=concurrency)
     await queue.start()
 
-    bot = Bot(
-        token=cfg.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode="HTML"),
-    )
-    # Sits below every bot API call: waits out Telegram flood limits
-    # (TelegramRetryAfter) and retries, so throttling never crashes a job.
-    bot.session.middleware(flood_control_middleware)
-    me = await bot.get_me()
-    log.info("logged in as @%s (id=%s)", me.username, me.id)
-
     dm_probe = DMProbe()
 
     job_runner = JobRunner(
@@ -110,6 +136,18 @@ async def run(cfg: Any) -> None:
         forward_log_channel_id=getattr(cfg, "FORWARD_LOG_CHANNEL_ID", "") or "",
     )
     await job_runner.start()
+
+    # Start the periodic backup loop (no-op unless a valid, admin-with-Edit-
+    # Messages channel exists — it validates + self-disables otherwise).
+    backup_manager = None
+    if backup_channel:
+        backup_manager = backup_mod.BackupManager(
+            bot=bot, cache=cache, cfg=cfg, me_id=me.id, boot=backup_boot,
+        )
+        try:
+            await backup_manager.start()
+        except Exception:
+            log.exception("[backup] failed to start backup loop")
 
     dp = Dispatcher()
     dp["config"] = cfg
@@ -141,5 +179,12 @@ async def run(cfg: Any) -> None:
         await queue.stop()
         await job_runner.close()
         await bot_stats.shutdown_flush()
+        # Final backup after stats are flushed, while the Bot session is
+        # still open. stop() cancels the loop then does one last upload.
+        if backup_manager is not None:
+            try:
+                await backup_manager.stop()
+            except Exception:
+                log.exception("[backup] shutdown backup failed")
         await registry.close_all()
         await bot.session.close()

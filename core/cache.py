@@ -16,6 +16,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from .atomic_io import atomic_write_bytes
 from .logging_setup import logger
 
 
@@ -99,15 +100,26 @@ class FileIdCache:
             self._data.pop(cache_key(provider, track_id, format_name), None)
             await asyncio.to_thread(self._flush)
 
-    def _flush(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+    def _serialize_locked(self) -> bytes:
+        """Canonical JSON bytes for the current in-memory state. Caller
+        holds `self._lock`. Kept in one place so `_flush` and the backup
+        snapshot are guaranteed byte-identical."""
         payload = {k: v.model_dump() for k, v in self._data.items()}
-        tmp.write_text(
-            json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self._path)
+        return json.dumps(
+            payload, indent=2, sort_keys=True, ensure_ascii=False
+        ).encode("utf-8")
+
+    async def serialize_bytes(self) -> bytes:
+        """Lock-consistent snapshot of the cache, byte-identical to what
+        `_flush` writes to disk. The backup subsystem uses this instead of
+        reading cache.json off disk, so it never races the delivery-path
+        `os.replace` (and gets an atomic, consistent view)."""
+        await self._ensure_loaded()
+        async with self._lock:
+            return self._serialize_locked()
+
+    def _flush(self) -> None:
+        atomic_write_bytes(self._path, self._serialize_locked())
 
     def __len__(self) -> int:
         return len(self._data)

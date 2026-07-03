@@ -77,12 +77,37 @@ def _atomic_write(path: Path, body: bytes) -> None:
 
 
 def _prune(events: list[dict[str, Any]], now_ts: float) -> None:
+    # Guard against a wildly-forward host clock (dead RTC battery, bad NTP,
+    # misconfigured VM). If `now` is more than a full retention window
+    # *beyond* the newest event, the clock is almost certainly wrong — a
+    # running bot always has recent events. Pruning here would delete every
+    # real event (and, once that empties a freshly restored file, propagate
+    # the loss into the next backup). Skip pruning instead of nuking data.
+    newest = max((float(e.get("ts") or 0) for e in events), default=0.0)
+    if newest and now_ts > newest + _PRUNE_AGE_SEC:
+        logger.warning(
+            "stats: clock looks wrong (now {:.0f} >> newest event {:.0f}); "
+            "skipping prune to avoid wiping history",
+            now_ts, newest,
+        )
+        if len(events) > _MAX_EVENTS:
+            del events[:-_MAX_EVENTS]
+        return
     cutoff = now_ts - _PRUNE_AGE_SEC
     kept = [e for e in events if float(e.get("ts") or 0) >= cutoff]
     if len(kept) > _MAX_EVENTS:
         kept = kept[-_MAX_EVENTS:]
     events.clear()
     events.extend(kept)
+
+
+async def serialize_snapshot_bytes() -> bytes:
+    """Lock-consistent JSON snapshot of the stats store, byte-identical to
+    what `_persist` writes to disk. Used by the backup subsystem so it never
+    reads bot_stats.json off disk mid-write."""
+    async with _store._lock:
+        payload = _store._serialize()
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _aggregate(
