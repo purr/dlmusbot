@@ -16,9 +16,10 @@ which delivers the audio to the user's DM.
 
 Search is parallel across providers with a hard per-provider timeout (so a
 single rate-limited or slow API doesn't stall the whole inline response).
-Whatever has come back when the deadline hits is what gets fuzzy-merged and
-shown — typically both Spotify + SoundCloud, but worst case one of them
-alone if the other is throttled.
+Whatever has come back when the deadline hits is deduped and interleaved
+round-robin (Spotify first, each provider's own ranking preserved) —
+typically both Spotify + SoundCloud, but worst case one of them alone if
+the other is throttled.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from core.fuzz import (
     dedupe_embedded_title,
     dedupe_near_duplicates,
     dedupe_tracks,
-    rank_balanced,
+    interleave_by_provider,
 )
 from core.logging_setup import logger
 from core.models import Track
@@ -500,20 +501,9 @@ async def _build_results(
     deduped = dedupe_tracks(merged)
     deduped = dedupe_near_duplicates(deduped)
     deduped = dedupe_embedded_title(deduped)
-    ranked = rank_balanced(query, deduped, limit=limit)
-    if not ranked and merged:
-        # Observability: providers returned hits but our scorer dropped
-        # everything below `min_score`. That's the exact pathology of
-        # the "user types 'X' and sees nothing matching X" bug — log it
-        # at WARNING so it surfaces in production before users report.
-        # Then fall back to the raw merged list rather than ship an
-        # empty inline answer.
-        logger.warning(
-            "search drop-everything: query={!r} providers_returned={} dedup={} "
-            "ranked=0 — falling back to raw merge",
-            query, total_found, len(deduped),
-        )
-        ranked = merged[:limit]
+    # No local re-scoring — provider ranking is authoritative (see
+    # `interleave_by_provider` for the rationale).
+    ranked = interleave_by_provider(deduped, limit=limit)
     # `total` is the raw summed provider count for the header text:
     # "Found X tracks" should reflect all provider hits together.
     return ranked, "search", total_found

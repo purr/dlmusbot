@@ -1,17 +1,22 @@
-"""Fuzzy match scoring for unifying multi-provider search results.
+"""Multi-provider search-result merging + fuzzy track matching.
 
-Each provider returns its own ranked list. We re-rank the merged set by how
-well the user's query matches the track, scoring artist and title as
-separate fields so a hit in either is rewarded — and adding a coverage
-bonus so a result that contains *every* query token wins over a result
-that only contains some of them.
+Search results are NOT re-scored locally — each provider's own ranking
+is trusted (see `interleave_by_provider` for why); the inline pipeline
+is dedupe (drop cross-provider re-uploads, keep the authoritative copy)
++ round-robin interleave.
+
+`score` serves track-to-track matching in `core.fallback`: given a
+known track's "artist title" string, pick the best-matching candidate
+from another provider's search results. It scores artist and title as
+separate fields and adds a token-coverage factor so a candidate that
+contains *every* query token beats one that only contains some.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Iterable
+from typing import Callable, Iterable
 
 from rapidfuzz import fuzz
 
@@ -232,8 +237,8 @@ def score(query: str, track: Track) -> float:
     Final = `base * (0.5 + 0.5 * coverage)`. Coverage of 1.0 keeps the
     full WRatio; coverage of 0 still leaves 50% so typos like "feever"
     against "Fever" don't get nuked to zero. Junk that has both low
-    WRatio AND low coverage naturally falls below `min_score` and is
-    dropped by `rank_balanced`.
+    WRatio AND low coverage naturally falls below the caller's cutoff
+    (`FALLBACK_MIN_SCORE` in `core.fallback`).
     """
     if not query:
         return 0.0
@@ -274,11 +279,21 @@ def score(query: str, track: Track) -> float:
     return base * (0.5 + 0.5 * coverage)
 
 
-def rank(query: str, tracks: Iterable[Track], limit: int = 20) -> list[Track]:
-    """Sort tracks by descending score, keep top `limit`. Stable on ties."""
-    scored = [(score(query, t), t) for t in tracks]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [t for _, t in scored[:limit]]
+# Authority order for cross-provider dedupe (which copy of a duplicated
+# track survives) AND for who takes the first slot of each interleave
+# round. Single source of truth for every pass below.
+PROVIDER_PRIORITY = ("spotify", "soundcloud", "youtube_music")
+
+
+def _provider_rank(prefer: tuple[str, ...]) -> Callable[[str], int]:
+    """Rank function over `prefer`: index in the tuple; providers not
+    listed rank after all listed ones."""
+    idx = {p: i for i, p in enumerate(prefer)}
+
+    def rank(provider: str) -> int:
+        return idx.get(provider, len(prefer))
+
+    return rank
 
 
 def _dedupe_key(t: Track) -> str:
@@ -286,28 +301,35 @@ def _dedupe_key(t: Track) -> str:
     Lowercased, whitespace collapsed, punctuation stripped — so "Track" /
     "track." / "TRACK" all collapse onto the same bucket."""
     raw = f"{_clean(t.artists_str)} {_clean(t.title)}"
+    key = re.sub(r"[^\w\s]", "", re.sub(r"\s+", " ", raw)).strip()
+    if key:
+        return key
+    # `_clean` ASCII-strips, so fully non-Latin metadata (Cyrillic, CJK,
+    # Arabic, ...) cleans to "". Build the key from the raw text instead
+    # — casefolded, punctuation stripped, Unicode preserved — so those
+    # tracks still dedupe cross-provider instead of being dropped.
+    raw = f"{t.artists_str} {t.title}".casefold()
     return re.sub(r"[^\w\s]", "", re.sub(r"\s+", " ", raw)).strip()
 
 
 def dedupe_tracks(
     tracks: Iterable[Track],
-    *, prefer: tuple[str, ...] = ("spotify", "soundcloud", "youtube_music"),
+    *, prefer: tuple[str, ...] = PROVIDER_PRIORITY,
 ) -> list[Track]:
     """Drop duplicate (artist, title) hits across providers.
 
     When the same song surfaces from multiple catalogues, keep the one
     from the highest-priority provider listed in `prefer`. Order of the
     remaining items is preserved (stable). Useful right before
-    `rank_balanced` so the round-robin doesn't waste a slot on a
-    SoundCloud-uploaded copy of a Spotify single."""
-    rank_by_provider = {p: i for i, p in enumerate(prefer)}
-    fallback_rank = len(prefer)
+    `interleave_by_provider` so the round-robin doesn't waste a slot on
+    a SoundCloud-uploaded copy of a Spotify single."""
+    rank = _provider_rank(prefer)
     best: dict[str, tuple[int, int, Track]] = {}
     for idx, t in enumerate(tracks):
         key = _dedupe_key(t)
         if not key:
             continue
-        prov_rank = rank_by_provider.get(t.provider, fallback_rank)
+        prov_rank = rank(t.provider)
         cur = best.get(key)
         if cur is None or prov_rank < cur[0]:
             best[key] = (prov_rank, idx, t)
@@ -354,24 +376,22 @@ def _titles_overlap(a: str, b: str) -> bool:
 
 def dedupe_near_duplicates(
     tracks: Iterable[Track],
-    *, prefer: tuple[str, ...] = ("spotify", "soundcloud", "youtube_music"),
-    duration_tolerance_s: int = _NEAR_DUP_DURATION_TOL_S,
-    title_similarity_threshold: int = _NEAR_DUP_TITLE_RATIO,
+    *, prefer: tuple[str, ...] = PROVIDER_PRIORITY,
 ) -> list[Track]:
     """Second-pass dedupe for tracks that exact-match missed.
 
     Two tracks are near-duplicates when ALL of:
       * Same primary artist (cleaned, case-insensitive).
-      * Durations differ by ≤ `duration_tolerance_s` (both must report
-        a non-zero duration — a missing duration disqualifies the
-        pair, so we never collapse unrelated tracks just because one
-        provider didn't report length).
+      * Durations differ by ≤ `_NEAR_DUP_DURATION_TOL_S` (both must
+        report a non-zero duration — a missing duration disqualifies
+        the pair, so we never collapse unrelated tracks just because
+        one provider didn't report length).
       * Cleaned titles overlap: one contains the other, OR
-        `fuzz.ratio` ≥ `title_similarity_threshold`.
+        `fuzz.ratio` ≥ `_NEAR_DUP_TITLE_RATIO`.
 
     Keeps the highest-priority provider per cluster. Preserves input
-    order among survivors so `rank_balanced` downstream still sees the
-    same order it would have seen otherwise.
+    order among survivors so `interleave_by_provider` downstream still
+    sees the same order it would have seen otherwise.
 
     Real case this catches: SoundCloud "myspacemark — march madness
     (MV IN DESC)" + Spotify "myspacemark — march madness", same
@@ -381,18 +401,17 @@ def dedupe_near_duplicates(
     if len(track_list) < 2:
         return track_list
 
-    rank_by_provider = {p: i for i, p in enumerate(prefer)}
-    fallback_rank = len(prefer)
+    rank = _provider_rank(prefer)
     keep = [True] * len(track_list)
+    artists = [_primary_artist_clean(t) for t in track_list]
+    titles = [_clean(t.title) for t in track_list]
 
     for i in range(len(track_list)):
         if not keep[i]:
             continue
         ti = track_list[i]
-        ti_artist = _primary_artist_clean(ti)
-        ti_title = _clean(ti.title)
         ti_dur = ti.duration_seconds
-        if not ti_artist or ti_dur <= 0:
+        if not artists[i] or ti_dur <= 0:
             continue
         for j in range(i + 1, len(track_list)):
             if not keep[j]:
@@ -400,17 +419,17 @@ def dedupe_near_duplicates(
             tj = track_list[j]
             if not tj.duration_seconds:
                 continue
-            if abs(ti_dur - tj.duration_seconds) > duration_tolerance_s:
+            if abs(ti_dur - tj.duration_seconds) > _NEAR_DUP_DURATION_TOL_S:
                 continue
-            if _primary_artist_clean(tj) != ti_artist:
+            if artists[j] != artists[i]:
                 continue
-            if not _titles_overlap(ti_title, _clean(tj.title)):
+            if not _titles_overlap(titles[i], titles[j]):
                 continue
             # Confirmed near-duplicate — keep the higher-priority
             # provider, drop the other. On tie, keep the earlier
             # input-order entry (so order is deterministic).
-            pi = rank_by_provider.get(ti.provider, fallback_rank)
-            pj = rank_by_provider.get(tj.provider, fallback_rank)
+            pi = rank(ti.provider)
+            pj = rank(tj.provider)
             if pi <= pj:
                 keep[j] = False
             else:
@@ -442,14 +461,14 @@ def _title_embeds_track(reup_title_clean: str, authoritative: Track) -> bool:
 
 def dedupe_embedded_title(
     tracks: Iterable[Track],
-    *, prefer: tuple[str, ...] = ("spotify", "soundcloud", "youtube_music"),
-    duration_tolerance_s: int = _NEAR_DUP_DURATION_TOL_S,
+    *, prefer: tuple[str, ...] = PROVIDER_PRIORITY,
 ) -> list[Track]:
     """Third-pass dedupe for cross-provider re-uploads whose ARTIST field
     differs but whose TITLE embeds the authoritative track's artist+song.
 
     Two tracks collapse when ALL of:
-      * Both report a non-zero duration differing by ≤ `duration_tolerance_s`.
+      * Both report a non-zero duration differing by
+        ≤ `_NEAR_DUP_DURATION_TOL_S`.
       * They come from different-priority providers (so one is clearly the
         authoritative source — Spotify over SoundCloud over YT Music).
       * The lower-priority track's cleaned title contains BOTH the
@@ -470,8 +489,7 @@ def dedupe_embedded_title(
     if len(track_list) < 2:
         return track_list
 
-    rank_by_provider = {p: i for i, p in enumerate(prefer)}
-    fallback_rank = len(prefer)
+    rank = _provider_rank(prefer)
     keep = [True] * len(track_list)
 
     for i in range(len(track_list)):
@@ -481,16 +499,16 @@ def dedupe_embedded_title(
         ti_dur = ti.duration_seconds
         if ti_dur <= 0:
             continue
-        pi = rank_by_provider.get(ti.provider, fallback_rank)
+        pi = rank(ti.provider)
         for j in range(i + 1, len(track_list)):
             if not keep[j]:
                 continue
             tj = track_list[j]
             if tj.duration_seconds <= 0:
                 continue
-            if abs(ti_dur - tj.duration_seconds) > duration_tolerance_s:
+            if abs(ti_dur - tj.duration_seconds) > _NEAR_DUP_DURATION_TOL_S:
                 continue
-            pj = rank_by_provider.get(tj.provider, fallback_rank)
+            pj = rank(tj.provider)
             if pi == pj:
                 # Same provider tier — neither is the authoritative source,
                 # so the "prefer Spotify" direction is undefined. Skip.
@@ -506,83 +524,40 @@ def dedupe_embedded_title(
     return [t for t, k in zip(track_list, keep) if k]
 
 
-def rank_balanced(
-    query: str, tracks: Iterable[Track], limit: int = 20,
+def interleave_by_provider(
+    tracks: Iterable[Track],
+    limit: int = 20,
     *,
-    min_score: float = 35.0,
-    bucket_size: float = 3.0,
-    provider_priority: tuple[str, ...] = (
-        "spotify", "soundcloud", "youtube_music",
-    ),
+    provider_priority: tuple[str, ...] = PROVIDER_PRIORITY,
 ) -> list[Track]:
-    """Score-first ranking with provider round-robin INSIDE tie buckets.
+    """Round-robin merge of already-ranked provider results.
 
-    Items are ordered by descending score. Within each "tie bucket"
-    (consecutive items whose scores fall inside `bucket_size` of each
-    other) the providers are round-robin'd in `provider_priority` order
-    — so when several tracks score equally the user sees a varied list
-    instead of one provider monopolising the top.
+    Each provider's search engine has ranked its own list with semantic
+    knowledge a lexical matcher lacks (stylised spellings like "Ke$ha",
+    aliases, slang, popularity), so that order is trusted as-is — no
+    local re-scoring, no dropping. One track per provider per turn:
+    Spotify's #1, SoundCloud's #1, Spotify's #2, ... `provider_priority`
+    decides who takes the first slot of each round; providers not listed
+    take their turn after the named ones (alphabetical, deterministic).
+    When one provider's queue runs dry the remaining ones keep rotating.
 
-    Why round-robin instead of priority-stack? When the user searches
-    a niche / SoundCloud-native artist (e.g. `"diegointhedark"`), every
-    legitimate hit is on SoundCloud and they all score the same as the
-    one or two Spotify tracks. Priority-stacking would keep all the
-    Spotify hits at the top and bury SoundCloud — which is exactly the
-    opposite of what the user wants for that artist. Round-robin gives
-    each provider equal footing inside a true tie.
-
-    Clear relevance gaps still win on score alone — the new scoring
-    consistently produces 10+ point spreads between real hits and
-    junk, so genuinely-better matches don't lose to interleaving.
-
-    `provider_priority` only decides the ORDER providers take their
-    turn (Spotify first, then SoundCloud, then YT Music), so Spotify
-    still wins the very-first slot when truly tied.
-
-    Items below `min_score` are dropped — they're noise.
+    Input order doubles as provider rank: `tracks` is the (deduped)
+    concatenation of per-provider result lists, and every dedupe pass is
+    stable, so each provider's tracks are still in that provider's own
+    ranking order here.
     """
-    prio = {p: i for i, p in enumerate(provider_priority)}
-    fallback = len(provider_priority)
-
-    scored: list[tuple[float, int, Track]] = []
-    for idx, t in enumerate(tracks):
-        s = score(query, t)
-        if s >= min_score:
-            scored.append((s, idx, t))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
+    rank = _provider_rank(provider_priority)
+    queues: dict[str, list[Track]] = {}
+    for t in tracks:
+        queues.setdefault(t.provider, []).append(t)
+    order = sorted(queues, key=lambda p: (rank(p), p))
     out: list[Track] = []
-    i = 0
-    while i < len(scored) and len(out) < limit:
-        top = scored[i][0]
-        bucket: list[tuple[float, int, Track]] = []
-        while i < len(scored) and (top - scored[i][0]) <= bucket_size:
-            bucket.append(scored[i])
-            i += 1
-        if len(bucket) <= 1:
-            out.append(bucket[0][2])
-            continue
-        # Group bucket by provider, preserving in-bucket score order
-        # inside each provider's queue (descending score, then input
-        # index for a stable final tiebreak).
-        by_prov: dict[str, list[Track]] = {}
-        for s, idx, t in bucket:
-            by_prov.setdefault(t.provider, []).append(t)
-        # Round-robin in provider_priority order. Providers not listed
-        # in priority take their turn after the named ones.
-        prov_order = sorted(
-            by_prov.keys(),
-            key=lambda p: (prio.get(p, fallback), p),
-        )
-        while by_prov and len(out) < limit:
-            for prov in list(prov_order):
-                queue = by_prov.get(prov)
-                if not queue:
-                    by_prov.pop(prov, None)
-                    continue
-                out.append(queue.pop(0))
-                if not queue:
-                    by_prov.pop(prov, None)
-                if len(out) >= limit:
-                    break
+    while len(out) < limit and any(queues.values()):
+        for prov in order:
+            queue = queues[prov]
+            if not queue:
+                continue
+            out.append(queue.pop(0))
+            if len(out) >= limit:
+                break
     return out
