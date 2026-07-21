@@ -282,9 +282,9 @@ async def _build_results(
 ) -> tuple[list[Track], str, int, str]:
     """Returns (tracks, mode, total, next_offset) where:
     tracks  — the page to render (at most `limit` entries). Container
-              modes ('playlist' / 'artist') honour `offset`; album and
-              playlist fetches are windowed provider-side so only the
-              requested page is hydrated.
+              modes ('playlist' / 'artist') honour `offset`; Spotify
+              album/playlist fetches hydrate only the requested window,
+              other providers fetch the full container and slice.
     mode    — 'single' | 'playlist' | 'artist' | 'search'.
     total   — *uncapped* hit count behind the response. The UI uses
               this for the "Found N tracks" header so the user sees
@@ -677,9 +677,9 @@ async def on_inline_query(
     # Container modes page through Telegram's inline pagination: each
     # answer carries at most `inline_results_limit` results plus a
     # `next_offset`; when the user scrolls to the end, Telegram re-sends
-    # the query with that offset and the next slice is served (album /
-    # playlist fetches are windowed provider-side, so later pages only
-    # hydrate their own slice). Search and single stay single-page.
+    # the query with that offset and the next slice is served. Spotify
+    # hydrates only the requested window; SC/YTM fetch the full container
+    # per page and slice. Search and single stay single-page.
     # isdecimal, not isdigit: isdigit passes superscripts int() rejects.
     raw_offset = (query.offset or "").strip()
     offset = int(raw_offset) if raw_offset.isdecimal() else 0

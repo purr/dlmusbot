@@ -526,10 +526,10 @@ class SoundCloudProvider(Provider):
             url=perm,
             tracks=tracks,
             # SC reports `track_count` on the user object, but it counts
-            # everything (incl. private / removed). Use the actual
-            # hydrated count for the visible total — what we'd actually
-            # show in inline.
-            total_tracks=user.get("track_count") or len(tracks),
+            # everything (incl. private / removed) while we fetch at most
+            # 50 uploads. Use the hydrated count so the "N tracks by this
+            # artist" header and pagination agree with what's shown.
+            total_tracks=len(tracks),
         )
 
     async def get_playlist(
