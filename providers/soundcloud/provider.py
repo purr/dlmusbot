@@ -14,6 +14,7 @@ import aiohttp
 
 from core.audio_convert import ffmpeg_available
 from core.exceptions import ProviderError, TrackNotFoundError
+from core.filenames import safe_filename
 from core.models import Album, ArtistRef, DownloadResult, Playlist, Track
 
 from .api import DEFAULT_HEADERS, SoundCloudAPI
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 
 
 def _sanitize_filename(name: str) -> str:
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(".") or "track"
+    return safe_filename(name)
 
 
 def _artist_ref_for(user: dict, fallback_name: Optional[str] = None) -> Optional[ArtistRef]:

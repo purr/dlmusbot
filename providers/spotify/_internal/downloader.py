@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 import aiohttp
+
+from core.filenames import safe_filename
 
 from . import aes
 from . import api as api_mod
@@ -32,7 +33,7 @@ async def _emit(cb: Optional[ProgressCallback], event: str, **info) -> None:
 
 
 def _safe_filename(name: str) -> str:
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(".") or "track"
+    return safe_filename(name)
 
 
 async def fetch_track_info(sp_dc: str, track_input: str) -> Track:

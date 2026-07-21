@@ -16,6 +16,7 @@ from typing import Optional
 import yt_dlp
 
 from core.exceptions import ProviderError, TrackNotFoundError
+from core.filenames import safe_filename
 from core.models import ArtistRef, DownloadResult, Playlist, Track
 
 from ..base import Provider, StageCallback
@@ -165,7 +166,7 @@ def _pick_artwork_url(
 
 
 def _sanitize_filename(name: str) -> str:
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(".") or "track"
+    return safe_filename(name)
 
 
 class YouTubeMusicProvider(Provider):
