@@ -505,6 +505,20 @@ class SoundCloudProvider(Provider):
         if uid is None:
             return None
         items = await self._api.get_user_tracks(uid, limit=50)
+        # Uploads come back in post order; surface the artist's best
+        # work first — most played, likes as tiebreak.
+        items = sorted(
+            items,
+            key=lambda it: (
+                int((it or {}).get("playback_count") or 0),
+                int(
+                    (it or {}).get("likes_count")
+                    or (it or {}).get("favoritings_count")
+                    or 0
+                ),
+            ),
+            reverse=True,
+        )
         tracks = [t for t in (_track_from_json(it) for it in items) if t]
         name = user.get("username") or "Unknown Artist"
         artwork = (user.get("avatar_url") or "").replace("-large.", "-t1080x1080.") or None
