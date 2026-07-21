@@ -484,21 +484,33 @@ class SpotifyProvider(Provider):
                 )
             )
 
-        try:
-            return await _run()
-        except TokenExpiredError:
-            # A 401 that survived the in-retry bearer refresh is most likely
-            # a client-token revoked server-side before its declared expiry.
-            # Force-mint a fresh one and retry the whole call once.
-            log.info(
-                "spotify search still 401 after bearer refresh; "
-                "refreshing client-token"
-            )
+        async def _attempt() -> list[Track]:
             try:
+                return await _run()
+            except TokenExpiredError:
+                # A 401 that survived the in-retry bearer refresh is most
+                # likely a client-token revoked server-side before its
+                # declared expiry. Force-mint a fresh one and retry the
+                # whole call once.
+                log.info(
+                    "spotify search still 401 after bearer refresh; "
+                    "refreshing client-token"
+                )
                 await self._client_token(force_refresh=True)
                 return await _run()
-            except SpotifyDownloaderError as e:
-                raise ProviderError(f"spotify search failed: {e}") from e
+
+        try:
+            return await _attempt()
+        except ProviderError as e:
+            # Pathfinder throws sporadic single-shot failures ("Failed call
+            # to search-api", WAF interstitials). One quick retry clears
+            # most of them and still fits the inline answer window.
+            log.warning("spotify search failed (%s); retrying once", e)
+            await asyncio.sleep(0.4)
+            try:
+                return await _attempt()
+            except SpotifyDownloaderError as e2:
+                raise ProviderError(f"spotify search failed: {e2}") from e2
         except SpotifyDownloaderError as e:
             raise ProviderError(f"spotify search failed: {e}") from e
 

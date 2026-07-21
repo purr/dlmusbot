@@ -6,6 +6,7 @@ from typing import Optional
 
 import aiohttp
 
+from core.http_retry import get_with_retry
 from core.logging_setup import logger
 
 from . import protobuf as pb
@@ -348,8 +349,12 @@ async def fetch_playback_files(
 
     Returns (linked_track_id, files). linked_track_id is the URI Spotify
     actually serves; if the input is itself canonical, this equals input."""
+    # track-playback rides Spotify's edge CDN, which throws transient
+    # 502/503 bursts — get_with_retry backs off and re-attempts before we
+    # give up on the request.
     try:
-        async with http.get(
+        async with await get_with_retry(
+            http,
             TRACK_PLAYBACK_URL.format(track_id=track_id),
             headers={"Authorization": f"Bearer {access_token}"},
             params={"manifestFileFormat": manifest_format},

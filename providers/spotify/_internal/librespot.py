@@ -199,6 +199,13 @@ class Session:
             raise
 
     async def _read_exact(self, n: int) -> bytes:
+        # `close()` nulls the streams while other coroutines may still be
+        # mid-call on the shared session (e.g. a concurrent worker dropped
+        # it for reconnect). Surface that as a ConnectionResetError — the
+        # provider's reconnect-and-retry layer handles it — instead of an
+        # AttributeError on None that nothing catches.
+        if self._reader is None:
+            raise ConnectionResetError("spotify AP session is closed")
         try:
             return await self._reader.readexactly(n)
         except asyncio.IncompleteReadError as e:
@@ -250,6 +257,8 @@ class Session:
         self._recv_nonce = 0
 
     async def _send_encoded(self, cmd: int, payload: bytes) -> None:
+        if self._writer is None:
+            raise ConnectionResetError("spotify AP session is closed")
         c = self._send_cipher
         c.nonce(self._send_nonce)
         self._send_nonce += 1
