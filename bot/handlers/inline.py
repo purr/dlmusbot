@@ -236,6 +236,40 @@ def _article(
 # ---- result builders per query kind --------------------------------------
 
 
+def _dedupe_exact(tracks: list[Track]) -> list[Track]:
+    """Container lists can contain the same track twice (Spotify's "Add
+    anyway", playlist curation quirks). Telegram rejects an entire inline
+    answer whose result ids repeat, so drop exact repeats keeping order.
+    Exact identity only — the fuzzy search dedupers would collapse
+    distinct tracks that legitimately share artist/title."""
+    seen: set[tuple[str, str]] = set()
+    out: list[Track] = []
+    for t in tracks:
+        k = (t.provider, t.track_id)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def _container_page(
+    fetched: list[Track], total: int, offset: int, limit: int
+) -> tuple[list[Track], str]:
+    """Page + next_offset for a provider-windowed container fetch
+    (`fetched` already covers [offset, offset+limit)). A next page is
+    offered while the window is non-empty and `total` says more remain.
+    Deliberately NOT gated on a full window: hydration skips one-off
+    unavailable tracks, and a single region-locked song mid-page must
+    not end pagination for the rest of the container."""
+    nxt = (
+        str(offset + limit)
+        if fetched and offset + limit < total
+        else ""
+    )
+    return _dedupe_exact(fetched), nxt
+
+
 async def _build_results(
     query: str,
     registry: Registry,
@@ -243,19 +277,25 @@ async def _build_results(
     search_providers: list[str],
     per_provider: int,
     limit: int,
-) -> tuple[list[Track], str, int]:
-    """Returns (tracks, mode, total) where:
-    tracks  — list capped at `limit` for display.
-    mode    — 'single' | 'playlist' | 'search'.
+    offset: int = 0,
+) -> tuple[list[Track], str, int, str]:
+    """Returns (tracks, mode, total, next_offset) where:
+    tracks  — the page to render (at most `limit` entries). Container
+              modes ('playlist' / 'artist') honour `offset`; album and
+              playlist fetches are windowed provider-side so only the
+              requested page is hydrated.
+    mode    — 'single' | 'playlist' | 'artist' | 'search'.
     total   — *uncapped* hit count behind the response. The UI uses
               this for the "Found N tracks" header so the user sees
-              the real total even when display is truncated."""
+              the real total even when display is truncated.
+    next_offset — value to hand Telegram for the next page ("" = no
+              further pages)."""
     direct = _parse_direct_id(query)
     if direct is not None:
         provider_name, track_id = direct
         provider = registry.get(provider_name)
         if provider is None:
-            return [], "unsupported_url", 0
+            return [], "unsupported_url", 0, ""
         try:
             t = await provider.get_track(track_id)
             if provider_name == "soundcloud":
@@ -270,20 +310,20 @@ async def _build_results(
                         if pe.reason in FALLBACK_REASONS:
                             alt, timed_out = await _inline_fallback(registry, t)
                             if alt is not None:
-                                return [alt], "single", 1
+                                return [alt], "single", 1, ""
                             if timed_out and pe.reason == "drm":
-                                return [], "drm_fallback_timeout", 0
+                                return [], "drm_fallback_timeout", 0, ""
                         raise
         except ProviderError as e:
             if e.reason == "goplus":
-                return [], "goplus_blocked", 0
+                return [], "goplus_blocked", 0, ""
             if e.reason == "unavailable":
-                return [], "track_unavailable", 0
+                return [], "track_unavailable", 0, ""
             if e.reason == "drm":
-                return [], "drm_blocked", 0
-            return [], "track_not_found", 0
+                return [], "drm_blocked", 0, ""
+            return [], "track_not_found", 0, ""
         except TrackNotFoundError:
-            return [], "track_not_found", 0
+            return [], "track_not_found", 0, ""
         except DlmusError as e:
             logger.debug(
                 "direct-id lookup failed [{}:{}]: {}: {}",
@@ -292,22 +332,22 @@ async def _build_results(
                 type(e).__name__,
                 e,
             )
-            return [], "track_not_found", 0
+            return [], "track_not_found", 0, ""
         except Exception:
             logger.exception(
                 "direct-id lookup crashed [%s:%s]",
                 provider_name,
                 track_id,
             )
-            return [], "track_not_found", 0
-        return ([t] if t else []), "single", (1 if t else 0)
+            return [], "track_not_found", 0, ""
+        return ([t] if t else []), "single", (1 if t else 0), ""
 
     parsed = parse_url(query, registry)
     if parsed is None and _looks_like_url(query):
         # User typed a URL that no provider claims. Don't pretend it's a
         # search query — surface "Unsupported URL" so they know which
         # platforms are actually wired up.
-        return [], "unsupported_url", 0
+        return [], "unsupported_url", 0, ""
     if parsed and parsed.kind == "url" and parsed.provider in {"spotify", "soundcloud"}:
         resolved = await resolve_short_url(parsed.entity_id)
         reparsed = parse_url(resolved, registry)
@@ -321,7 +361,7 @@ async def _build_results(
                 url=resolved,
             )
         else:
-            return [], "unsupported_url", 0
+            return [], "unsupported_url", 0, ""
     if parsed:
         provider = registry.get(parsed.provider)
         if provider is not None:
@@ -341,50 +381,63 @@ async def _build_results(
                                     if pe.reason in FALLBACK_REASONS:
                                         alt, timed_out = await _inline_fallback(registry, t)
                                         if alt is not None:
-                                            return [alt], "single", 1
+                                            return [alt], "single", 1, ""
                                         if timed_out and pe.reason == "drm":
-                                            return [], "drm_fallback_timeout", 0
+                                            return [], "drm_fallback_timeout", 0, ""
                                     raise
-                        return [t], "single", 1
+                        return [t], "single", 1, ""
                     except ProviderError as e:
                         if e.reason == "goplus":
-                            return [], "goplus_blocked", 0
+                            return [], "goplus_blocked", 0, ""
                         if e.reason == "unavailable":
-                            return [], "track_unavailable", 0
+                            return [], "track_unavailable", 0, ""
                         if e.reason == "drm":
-                            return [], "drm_blocked", 0
+                            return [], "drm_blocked", 0, ""
                         raise
                 if parsed.kind == "album":
-                    album = await provider.get_album(parsed.entity_id)
+                    album = await provider.get_album(
+                        parsed.entity_id, offset=offset, limit=limit
+                    )
                     if album is None:
-                        return [], "playlist", 0
+                        return [], "playlist", 0, ""
                     total = album.total_tracks or len(album.tracks)
-                    return list(album.tracks)[:limit], "playlist", total
+                    page, nxt = _container_page(
+                        list(album.tracks), total, offset, limit
+                    )
+                    return page, "playlist", total, nxt
                 if parsed.kind == "playlist":
-                    pl = await provider.get_playlist(parsed.entity_id)
+                    pl = await provider.get_playlist(
+                        parsed.entity_id, offset=offset, limit=limit
+                    )
                     if pl is None:
-                        return [], "playlist", 0
+                        return [], "playlist", 0, ""
                     total = pl.total_tracks or len(pl.tracks)
-                    return list(pl.tracks)[:limit], "playlist", total
+                    page, nxt = _container_page(
+                        list(pl.tracks), total, offset, limit
+                    )
+                    return page, "playlist", total, nxt
                 if parsed.kind == "artist":
-                    # Wrap separately so a Mercury 404 (bogus id) maps
-                    # to "artist_not_found" rather than the generic
-                    # outer "unsupported_url" handler — the user's
-                    # intent (artist URL) is unambiguous here.
+                    # Wrap separately so a nonexistent artist (Mercury
+                    # 404 → reason "unavailable") maps to
+                    # "artist_not_found"; a transient fetch/search
+                    # failure falls through to the outer DlmusError
+                    # handler and renders as "Please try again later"
+                    # instead of falsely claiming the artist is gone.
                     try:
                         artist = await provider.get_artist(parsed.entity_id)
-                    except Exception:
-                        logger.exception(
-                            "artist resolve failed: {}",
-                            parsed.url,
-                        )
-                        return [], "artist_not_found", 0
+                    except ProviderError as e:
+                        if e.reason == "unavailable":
+                            return [], "artist_not_found", 0, ""
+                        raise
                     if artist is None:
-                        return [], "artist_not_found", 0
-                    total = artist.total_tracks or len(artist.tracks)
+                        return [], "artist_not_found", 0, ""
                     if not artist.tracks:
-                        return [], "artist_empty", 0
-                    return list(artist.tracks)[:limit], "artist", total
+                        return [], "artist_empty", 0, ""
+                    full = _dedupe_exact(list(artist.tracks))
+                    total = artist.total_tracks or len(full)
+                    page = full[offset : offset + limit]
+                    nxt = str(offset + limit) if offset + limit < len(full) else ""
+                    return page, "artist", total, nxt
                 if parsed.kind == "url" and parsed.provider == "soundcloud":
                     from providers.soundcloud.provider import (  # noqa: SLF001
                         SoundCloudProvider,
@@ -395,14 +448,14 @@ async def _build_results(
                         try:
                             kind, data = await provider.resolve_kind(parsed.entity_id)
                         except TrackNotFoundError:
-                            return [], "unsupported_url", 0
+                            return [], "unsupported_url", 0, ""
                         if kind == "track":
                             t = _track_from_json(data)
                             if t is not None and (t.extra or {}).get("is_goplus"):
                                 alt, _timed_out = await _inline_fallback(registry, t)
                                 if alt is not None:
-                                    return [alt], "single", 1
-                                return [], "goplus_blocked", 0
+                                    return [alt], "single", 1, ""
+                                return [], "goplus_blocked", 0, ""
                             if t is not None:
                                 try:
                                     await provider.preflight_track(t)
@@ -410,17 +463,17 @@ async def _build_results(
                                     if pe.reason in FALLBACK_REASONS:
                                         alt, timed_out = await _inline_fallback(registry, t)
                                         if alt is not None:
-                                            return [alt], "single", 1
+                                            return [alt], "single", 1, ""
                                         if timed_out and pe.reason == "drm":
-                                            return [], "drm_fallback_timeout", 0
+                                            return [], "drm_fallback_timeout", 0, ""
                                     if pe.reason == "goplus":
-                                        return [], "goplus_blocked", 0
+                                        return [], "goplus_blocked", 0, ""
                                     if pe.reason == "drm":
-                                        return [], "drm_blocked", 0
+                                        return [], "drm_blocked", 0, ""
                                     if pe.reason == "unavailable":
-                                        return [], "track_unavailable", 0
+                                        return [], "track_unavailable", 0, ""
                                     raise
-                            return ([t] if t else []), "single", (1 if t else 0)
+                            return ([t] if t else []), "single", (1 if t else 0), ""
                         if kind == "playlist":
                             # Delegate to the album/playlist resolver so
                             # stub tracks (SC only inlines metadata for
@@ -428,33 +481,43 @@ async def _build_results(
                             # this every entry past the 5th shows up as
                             # "Unknown Artist - Unknown".
                             container = await (
-                                provider.get_album(parsed.entity_id)
+                                provider.get_album(
+                                    parsed.entity_id, offset=offset, limit=limit
+                                )
                                 if data.get("is_album")
-                                else provider.get_playlist(parsed.entity_id)
+                                else provider.get_playlist(
+                                    parsed.entity_id, offset=offset, limit=limit
+                                )
                             )
                             if container is None:
-                                return [], "playlist", 0
+                                return [], "playlist", 0, ""
                             total = container.total_tracks or len(container.tracks)
-                            return list(container.tracks)[:limit], "playlist", total
+                            page, nxt = _container_page(
+                                list(container.tracks), total, offset, limit
+                            )
+                            return page, "playlist", total, nxt
                         if kind == "user":
                             # Artist profile on SoundCloud — pull their
                             # own uploads (no reposts) via get_artist.
                             artist = await provider.get_artist(parsed.entity_id)
                             if artist is None:
-                                return [], "artist_not_found", 0
+                                return [], "artist_not_found", 0, ""
                             if not artist.tracks:
-                                return [], "artist_empty", 0
-                            total = artist.total_tracks or len(artist.tracks)
-                            return list(artist.tracks)[:limit], "artist", total
+                                return [], "artist_empty", 0, ""
+                            full = _dedupe_exact(list(artist.tracks))
+                            total = artist.total_tracks or len(full)
+                            page = full[offset : offset + limit]
+                            nxt = str(offset + limit) if offset + limit < len(full) else ""
+                            return page, "artist", total, nxt
                         # SC URL resolved to something we can't handle.
                         logger.info(
                             "soundcloud URL resolved to unsupported kind={!r}: {}",
                             kind,
                             parsed.url,
                         )
-                        return [], "unsupported_url", 0
+                        return [], "unsupported_url", 0, ""
             except TrackNotFoundError:
-                return [], "track_not_found", 0
+                return [], "track_not_found", 0, ""
             except DlmusError as e:
                 # URL was recognised + claimed by a provider, so this is
                 # a fetch failure (token rotation, AP socket drop, region
@@ -469,7 +532,7 @@ async def _build_results(
                     type(e).__name__,
                     e,
                 )
-                return [], "url_fetch_failed", 0
+                return [], "url_fetch_failed", 0, ""
             except Exception:
                 logger.exception(
                     "inline url resolve crashed [{}:{}:{}]",
@@ -477,7 +540,7 @@ async def _build_results(
                     parsed.kind,
                     parsed.entity_id,
                 )
-                return [], "url_fetch_failed", 0
+                return [], "url_fetch_failed", 0, ""
 
     tasks: list[asyncio.Task[list[Track]]] = []
     for name in search_providers:
@@ -486,7 +549,7 @@ async def _build_results(
             continue
         tasks.append(asyncio.create_task(_safe_search(p, query, per_provider)))
     if not tasks:
-        return [], "search", 0
+        return [], "search", 0, ""
     bundles = await asyncio.gather(*tasks)
     merged: list[Track] = [t for bundle in bundles for t in bundle]
     total_found = sum(len(bundle) for bundle in bundles)
@@ -506,7 +569,7 @@ async def _build_results(
     ranked = interleave_by_provider(deduped, limit=limit)
     # `total` is the raw summed provider count for the header text:
     # "Found X tracks" should reflect all provider hits together.
-    return ranked, "search", total_found
+    return ranked, "search", total_found, ""
 
 
 async def _safe_search(provider, query: str, limit: int) -> list[Track]:
@@ -610,28 +673,42 @@ async def on_inline_query(
         )
         return
 
-    tracks, mode, total = await _build_results(
+    # Container modes page through Telegram's inline pagination: each
+    # answer carries at most `inline_results_limit` results plus a
+    # `next_offset`; when the user scrolls to the end, Telegram re-sends
+    # the query with that offset and the next slice is served (album /
+    # playlist fetches are windowed provider-side, so later pages only
+    # hydrate their own slice). Search and single stay single-page.
+    # isdecimal, not isdigit: isdigit passes superscripts int() rejects.
+    raw_offset = (query.offset or "").strip()
+    offset = int(raw_offset) if raw_offset.isdecimal() else 0
+
+    page, mode, total, next_offset = await _build_results(
         text,
         registry,
         cache,
         inline_search_providers,
         per_provider_limit,
         inline_results_limit,
+        offset,
     )
+    if mode not in ("playlist", "artist"):
+        offset = 0  # numbering only continues across container pages
 
     results: list[InlineQueryResultArticle] = []
-    for i, t in enumerate(tracks):
+    for i, t in enumerate(page):
         # Title shape per mode:
         #   single    -> 🎵 <title>             (one track URL paste; no
         #                                       index, no platform tag)
-        #   playlist  -> {i+1}. <title>          (album / playlist track list)
-        #   artist    -> {i+1}. <title>          (artist's catalogue)
+        #   playlist  -> {n}. <title>            (album / playlist track list,
+        #                                       numbering continues across pages)
+        #   artist    -> {n}. <title>            (artist's catalogue)
         #   search    -> <title>                  (free-text query; platform
         #                                       indicator goes in description)
         if mode == "single":
             title = f"🎵 {t.title}"
         elif mode in ("playlist", "artist"):
-            title = f"{i + 1}. {t.title}"
+            title = f"{offset + i + 1}. {t.title}"
         else:
             title = t.title or "Untitled Track"
         results.append(
@@ -640,7 +717,7 @@ async def on_inline_query(
                 title=title,
                 registry=registry,
                 bot_username=bot_username,
-                idx=i,
+                idx=offset + i,
                 show_provider=(mode == "search"),
             )
         )
@@ -694,6 +771,8 @@ async def on_inline_query(
         "cache_time": 0 if is_url_mode else inline_cache_s,
         "is_personal": True,
     }
+    if next_offset:
+        answer_kwargs["next_offset"] = next_offset
     if switch_pm_text is not None:
         answer_kwargs["switch_pm_text"] = switch_pm_text
         answer_kwargs["switch_pm_parameter"] = "from_inline"
@@ -705,9 +784,10 @@ async def on_inline_query(
     with contextlib.suppress(TelegramBadRequest):
         await query.answer(**answer_kwargs)
     logger.info(
-        "<cyan>[inline]</cyan> done user={} mode={} total={} shown={}",
+        "<cyan>[inline]</cyan> done user={} mode={} total={} shown={} offset={}",
         query.from_user.id if query.from_user else "?",
         mode,
         total,
         len(results),
+        offset,
     )

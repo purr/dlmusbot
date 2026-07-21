@@ -82,9 +82,7 @@ async def _reject_artist(
     seed = artist_name
     if not seed and provider is not None:
         try:
-            artist = await provider.get_artist(parsed.entity_id)
-            if artist is not None and artist.title:
-                seed = artist.title
+            seed = await provider.get_artist_name(parsed.entity_id)
         except Exception as e:
             logger.warning(
                 "artist name resolve failed for {} ({}): {}",

@@ -224,7 +224,9 @@ class YouTubeMusicProvider(Provider):
             raise TrackNotFoundError(f"yt music {entity_id} not parseable")
         return t
 
-    async def get_playlist(self, entity_id: str) -> Optional[Playlist]:
+    async def get_playlist(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Playlist]:
         url = f"https://music.youtube.com/playlist?list={entity_id}"
         info = await asyncio.to_thread(
             self._extract_info,
@@ -235,6 +237,9 @@ class YouTubeMusicProvider(Provider):
             return None
         entries = info.get("entries") or []
         tracks = [t for t in (_entry_to_track(e) for e in entries) if t]
+        total = len(tracks)
+        if offset or limit is not None:
+            tracks = tracks[offset : (offset + limit) if limit else None]
         return Playlist(
             provider="youtube_music",
             playlist_id=entity_id,
@@ -242,6 +247,7 @@ class YouTubeMusicProvider(Provider):
             owner=info.get("uploader"),
             url=f"https://music.youtube.com/playlist?list={entity_id}",
             tracks=tracks,
+            total_tracks=total,
         )
 
     async def download(

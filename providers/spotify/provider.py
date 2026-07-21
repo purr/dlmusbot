@@ -534,19 +534,24 @@ class SpotifyProvider(Provider):
             raise ProviderError(f"spotify track fetch failed: {e}") from e
         return _track_from_internal(st)
 
-    async def get_album(self, entity_id: str) -> Optional[Album]:
+    async def get_album(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Album]:
         # Mercury album endpoint — same /v1/albums data without the
         # TOTP-token rate cap that breaks the Web API. Mercury's album
         # proto only carries track GIDs (no per-track metadata), so we
-        # then hydrate each via the track endpoint (~50 ms / track).
+        # then hydrate each via the track endpoint (~50 ms / track) —
+        # only the requested (offset, limit) window, so inline pagination
+        # can walk long albums page by page within the answer deadline.
         gid_hex = base62_to_gid(entity_id).hex()
+        window = slice(offset, offset + (limit or PLAYLIST_TRACK_LIMIT))
 
         async def _fetch(s: Session):
             sp_album, gid_list = await api_mod.fetch_album_track_gids(s, gid_hex)
             if sp_album is None:
                 return None, [], 0
             sp_tracks: list[_SpTrack] = []
-            for g in gid_list[:PLAYLIST_TRACK_LIMIT]:
+            for g in gid_list[window]:
                 try:
                     st = await api_mod.fetch_track_basic(s, g)
                 except SpotifyDownloaderError as e:
@@ -569,19 +574,60 @@ class SpotifyProvider(Provider):
             return None
         return _album_from_internal(sp_album, sp_tracks, total_tracks=full_count)
 
-    async def get_artist(self, entity_id: str) -> Optional[Playlist]:
-        # Mercury artist endpoint returns top-track gids per country (only
-        # the first populated bucket is used — usually the global / US set
-        # of ~10 most-streamed tracks). Each gid is then hydrated via
-        # fetch_track_basic in the same Session.
+    async def _artist_name_and_top_gids(
+        self, entity_id: str
+    ) -> tuple[Optional[str], list[str]]:
         gid_hex = base62_to_gid(entity_id).hex()
+        try:
+            return await self._with_session(
+                lambda s: api_mod.fetch_artist_top_tracks(s, gid_hex)
+            )
+        except TrackUnavailableError as e:
+            raise ProviderError(
+                f"spotify artist {entity_id} unavailable: {e}",
+                reason="unavailable",
+            ) from e
+        except SpotifyDownloaderError as e:
+            raise ProviderError(f"spotify artist fetch failed: {e}") from e
 
-        async def _fetch(s: Session):
-            name, gid_list = await api_mod.fetch_artist_top_tracks(s, gid_hex)
-            if not gid_list:
-                return name, []
-            sp_tracks: list[_SpTrack] = []
-            for g in gid_list[:PLAYLIST_TRACK_LIMIT]:
+    async def get_artist_name(self, entity_id: str) -> Optional[str]:
+        name, _ = await self._artist_name_and_top_gids(entity_id)
+        return name or None
+
+    async def get_artist(self, entity_id: str) -> Optional[Playlist]:
+        # Resolve the artist's NAME via the Mercury artist endpoint, then
+        # reuse the normal search ranking for the track list. The artist
+        # page's static top-tracks bucket maxes out at ~10 songs; a name
+        # search surfaces what Spotify itself ranks for the name — a
+        # fuller catalogue including features and collabs. If pathfinder
+        # search is down, degrade to the Mercury top-tracks bucket rather
+        # than failing the whole artist page.
+        name, top_gids = await self._artist_name_and_top_gids(entity_id)
+        if not name:
+            return None  # no artist record at all
+        try:
+            tracks = await self.search(name, limit=50)
+        except ProviderError as e:
+            log.warning(
+                "spotify artist search failed (%s); falling back to top tracks", e
+            )
+            tracks = []
+        if not tracks and top_gids:
+            tracks = await self._hydrate_top_gids(top_gids)
+        return Playlist(
+            provider="spotify",
+            playlist_id=entity_id,
+            title=name,
+            owner=name,
+            url=f"https://open.spotify.com/artist/{entity_id}",
+            tracks=tracks,
+            total_tracks=len(tracks),
+        )
+
+    async def _hydrate_top_gids(self, gids: list) -> list[Track]:
+        async def _fetch(s: Session) -> list[_SpTrack]:
+            out: list[_SpTrack] = []
+            for g in gids[:PLAYLIST_TRACK_LIMIT]:
                 try:
                     st = await api_mod.fetch_track_basic(s, g)
                 except SpotifyDownloaderError as e:
@@ -593,36 +639,24 @@ class SpotifyProvider(Provider):
                     )
                     continue
                 if st is not None:
-                    sp_tracks.append(st)
-            return name, sp_tracks
+                    out.append(st)
+            return out
 
         try:
-            name, sp_tracks = await self._with_session(_fetch)
-        except TrackUnavailableError as e:
-            raise ProviderError(
-                f"spotify artist {entity_id} unavailable: {e}",
-                reason="unavailable",
-            ) from e
+            sp_tracks = await self._with_session(_fetch)
         except SpotifyDownloaderError as e:
-            raise ProviderError(f"spotify artist fetch failed: {e}") from e
+            log.warning("artist top-track fallback failed: %s", e)
+            return []
+        return [_track_from_internal(st) for st in sp_tracks]
 
-        if not name:
-            return None  # no artist record at all
-        return Playlist(
-            provider="spotify",
-            playlist_id=entity_id,
-            title=name,
-            owner=name,
-            url=f"https://open.spotify.com/artist/{entity_id}",
-            tracks=[_track_from_internal(st) for st in sp_tracks],
-            total_tracks=len(sp_tracks),
-        )
-
-    async def get_playlist(self, entity_id: str) -> Optional[Playlist]:
+    async def get_playlist(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Playlist]:
         # Two-step: spclient/playlist/v2 for the URI list, then per-track
-        # Mercury fetches for metadata. Capped at PLAYLIST_TRACK_LIMIT so
-        # absurdly long Spotify mixes don't blow past the inline-query
-        # deadline (each Mercury hop is ~50ms, serialised by Session._lock).
+        # Mercury fetches for metadata — only the requested (offset,
+        # limit) window, so absurdly long Spotify mixes don't blow past
+        # the inline-query deadline (each Mercury hop is ~50ms,
+        # serialised by Session._lock) and pagination can walk the rest.
         assert self._http is not None
         url = f"{search_mod.PLAYLIST_V2_BASE}/{entity_id}"
 
@@ -669,8 +703,7 @@ class SpotifyProvider(Provider):
                 tid = uri.rsplit(":", 1)[-1]
                 if tid:
                     track_ids.append(tid)
-            if len(track_ids) >= PLAYLIST_TRACK_LIMIT:
-                break
+        track_ids = track_ids[offset : offset + (limit or PLAYLIST_TRACK_LIMIT)]
         if full_length is None:
             # spclient sometimes omits length on small playlists; the URI
             # list itself is then the source of truth (uncapped count).

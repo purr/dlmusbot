@@ -456,12 +456,16 @@ class SoundCloudProvider(Provider):
             reason="unavailable",
         )
 
-    async def get_album(self, entity_id: str) -> Optional[Album]:
+    async def get_album(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Album]:
         data = await self._api.resolve(entity_id)
         if data.get("kind") != "playlist" or not data.get("is_album"):
             return None
         owner_user = data.get("user") or {}
         hydrated, total = await self._hydrate_playlist_tracks(data)
+        if offset or limit is not None:
+            hydrated = hydrated[offset : (offset + limit) if limit else None]
         return Album(
             provider="soundcloud",
             album_id=str(data.get("id")),
@@ -472,6 +476,15 @@ class SoundCloudProvider(Provider):
             tracks=hydrated,
             total_tracks=total,
         )
+
+    async def get_artist_name(self, entity_id: str) -> Optional[str]:
+        try:
+            user = await self._api.resolve(entity_id)
+        except TrackNotFoundError:
+            return None
+        if user.get("kind") != "user":
+            return None
+        return user.get("username") or None
 
     async def get_artist(self, entity_id: str) -> Optional[Playlist]:
         """SoundCloud-side artist resolution.
@@ -514,11 +527,15 @@ class SoundCloudProvider(Provider):
             total_tracks=user.get("track_count") or len(tracks),
         )
 
-    async def get_playlist(self, entity_id: str) -> Optional[Playlist]:
+    async def get_playlist(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Playlist]:
         data = await self._api.resolve(entity_id)
         if data.get("kind") != "playlist" or data.get("is_album"):
             return None
         hydrated, total = await self._hydrate_playlist_tracks(data)
+        if offset or limit is not None:
+            hydrated = hydrated[offset : (offset + limit) if limit else None]
         return Playlist(
             provider="soundcloud",
             playlist_id=str(data.get("id")),

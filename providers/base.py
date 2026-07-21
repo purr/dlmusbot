@@ -107,12 +107,25 @@ class Provider(abc.ABC):
     async def get_track(self, entity_id: str) -> Track:
         """Fetch a single track by provider-native id."""
 
-    async def get_album(self, entity_id: str) -> Optional[Album]:
-        """Fetch an album. None if provider doesn't expose albums."""
+    async def get_album(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Album]:
+        """Fetch an album. None if provider doesn't expose albums.
+        `offset`/`limit` window the returned tracks (inline pagination);
+        `total_tracks` always reflects the full container size."""
         return None
 
-    async def get_playlist(self, entity_id: str) -> Optional[Playlist]:
-        """Fetch a playlist. None if provider doesn't expose playlists."""
+    async def get_playlist(
+        self, entity_id: str, *, offset: int = 0, limit: Optional[int] = None
+    ) -> Optional[Playlist]:
+        """Fetch a playlist. None if provider doesn't expose playlists.
+        Same `offset`/`limit` windowing contract as `get_album`."""
+        return None
+
+    async def get_artist_name(self, entity_id: str) -> Optional[str]:
+        """Display name of an artist, when cheaply resolvable (one
+        metadata call — no track listing). None if the provider can't
+        say without heavier work."""
         return None
 
     async def get_artist(self, entity_id: str) -> Optional[Playlist]:
