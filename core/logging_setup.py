@@ -75,8 +75,10 @@ class InterceptHandler(logging.Handler):
         )
 
 
+# Date included: pm2 log files span weeks, and time-only stamps make any
+# after-the-fact analysis guesswork across midnight rollovers.
 _FORMAT = (
-    "<green>{time:HH:mm:ss.SSS}</green> "
+    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> "
     "<level>{level: <7}</level> "
     "<dim><cyan>{name}</cyan>:<cyan>{line}</cyan></dim> "
     "<level>{message}</level>"
