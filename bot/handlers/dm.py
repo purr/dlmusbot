@@ -67,39 +67,21 @@ async def _reject_collection(
     )
 
 
-async def _reject_artist(
-    message: Message,
-    parsed: ParsedURL,
-    provider,
-    artist_name: str | None = None,
-) -> None:
+async def _reject_artist(message: Message, parsed: ParsedURL) -> None:
     """Artist pages have no single track to download — mirror the
-    album/playlist bounce: a switch-inline button that fills the user's
-    chatbox. Seeded with the artist's NAME when resolvable (a name
-    search finds their songs across every provider); falls back to the
-    URL itself, which inline mode also expands into the artist's
-    tracks."""
-    seed = artist_name
-    if not seed and provider is not None:
-        try:
-            seed = await provider.get_artist_name(parsed.entity_id)
-        except Exception as e:
-            logger.warning(
-                "artist name resolve failed for {} ({}): {}",
-                parsed.url,
-                type(e).__name__,
-                e,
-            )
+    album/playlist bounce: a switch-inline button seeded with the artist
+    URL itself. Inline mode expands artist URLs into the artist's track
+    list, so no name resolution is needed."""
     await message.reply(
         "👤 <b>Artist links aren't supported in DM.</b>\n"
-        "Tap below to search this artist inline and pick the tracks "
+        "Tap below to open the artist inline and pick the tracks "
         "you want.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="🔍 Search this artist inline",
-                        switch_inline_query_current_chat=seed or parsed.url,
+                        text="🔍 Open artist inline",
+                        switch_inline_query_current_chat=parsed.url,
                     )
                 ]
             ]
@@ -185,7 +167,7 @@ async def _enqueue_url(
         return
 
     if parsed.kind == "artist":
-        await _reject_artist(message, parsed, provider)
+        await _reject_artist(message, parsed)
         return
 
     if parsed.kind == "track":
@@ -261,12 +243,8 @@ async def _enqueue_url(
             await _reject_collection(message, parsed, kind_label=label)
             return
         if kind == "user":
-            # Artist profile — same bounce as the generic artist branch;
-            # the resolved user object already carries the display name,
-            # so seed the search button without a second API call.
-            await _reject_artist(
-                message, parsed, provider, artist_name=data.get("username"),
-            )
+            # Artist profile — same bounce as the generic artist branch.
+            await _reject_artist(message, parsed)
             return
         raise UnsupportedURLError(f"unknown SoundCloud entity kind: {kind}")
 

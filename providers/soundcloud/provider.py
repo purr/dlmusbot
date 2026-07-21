@@ -477,15 +477,6 @@ class SoundCloudProvider(Provider):
             total_tracks=total,
         )
 
-    async def get_artist_name(self, entity_id: str) -> Optional[str]:
-        try:
-            user = await self._api.resolve(entity_id)
-        except TrackNotFoundError:
-            return None
-        if user.get("kind") != "user":
-            return None
-        return user.get("username") or None
-
     async def get_artist(self, entity_id: str) -> Optional[Playlist]:
         """SoundCloud-side artist resolution.
 

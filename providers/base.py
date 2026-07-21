@@ -122,12 +122,6 @@ class Provider(abc.ABC):
         Same `offset`/`limit` windowing contract as `get_album`."""
         return None
 
-    async def get_artist_name(self, entity_id: str) -> Optional[str]:
-        """Display name of an artist, when cheaply resolvable (one
-        metadata call — no track listing). None if the provider can't
-        say without heavier work."""
-        return None
-
     async def get_artist(self, entity_id: str) -> Optional[Playlist]:
         """Fetch an artist's catalog as a Playlist (their *own* uploads /
         releases, no reposts). None if provider doesn't expose artists or

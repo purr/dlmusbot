@@ -610,10 +610,6 @@ class SpotifyProvider(Provider):
         except SpotifyDownloaderError as e:
             raise ProviderError(f"spotify artist fetch failed: {e}") from e
 
-    async def get_artist_name(self, entity_id: str) -> Optional[str]:
-        name, _ = await self._artist_name_and_top_gids(entity_id)
-        return name or None
-
     async def get_artist(self, entity_id: str) -> Optional[Playlist]:
         # Resolve the artist's NAME via the Mercury artist endpoint, then
         # reuse the normal search ranking for the track list. The artist
