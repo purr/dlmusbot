@@ -74,6 +74,11 @@ DOWNLOAD_CONCURRENCY: int = 0
 # Premium, 2000 MB with. Files above this are rejected with a friendly note.
 MAX_FILE_MB: int = 50
 
+# Most fresh downloads (no cached file_id yet) a single user may have in
+# the download queue at once. Requests over the cap get a failure keyboard
+# with a Try Again button. Cached tracks bypass the queue and never count.
+MAX_USER_QUEUE: int = 10
+
 # JSON cache mapping (provider, track_id, format) -> Telegram file_id. This
 # is just metadata — no audio bytes are stored locally. Survives restarts so
 # repeat downloads return instantly via Telegram's CDN.

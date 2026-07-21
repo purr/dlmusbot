@@ -49,6 +49,10 @@ STATUS_ALERTS: dict[str, str] = {
     "uploading": "Sending the file.",
     "reencoded": "This file was re-encoded to fit the upload size limit.",
     "failed": "Couldn't download — tap Try Again to retry.",
+    "queue_full": (
+        "You have too many tracks in the download queue. Wait for some "
+        "to finish, then tap Try Again."
+    ),
     "final_failed": "Couldn't download. Try a different track or service.",
     "final_failed:too_long": ("This track is too long to upload to Telegram, sorry!"),
     "final_failed:too_big": (
@@ -86,6 +90,15 @@ def lookup_status_alert(stage_key: str) -> str:
             return (
                 f"This file was re-encoded to {kbps} kbps to fit the "
                 "upload size limit."
+            )
+        except (ValueError, IndexError):
+            pass
+    if stage_key.startswith("queue_full:"):
+        try:
+            cap = int(stage_key.split(":", 1)[1])
+            return (
+                f"You already have {cap} tracks in the download queue. "
+                "Wait for some to finish, then tap Try Again."
             )
         except (ValueError, IndexError):
             pass
@@ -162,6 +175,15 @@ def failed_status_button() -> InlineKeyboardButton:
         text="❌ Download failed",
         callback_data="status:failed",
     )
+
+
+def queue_full_status_button(cap: Optional[int] = None) -> InlineKeyboardButton:
+    """Failure label shown when the user already has the maximum number
+    of fresh downloads waiting in the queue. Encodes the cap in the
+    callback (`status:queue_full:<n>`) so the popup can state the actual
+    limit; without it the generic `queue_full` alert is shown."""
+    cb = f"status:queue_full:{cap}" if cap and cap > 0 else "status:queue_full"
+    return InlineKeyboardButton(text="❌ Queue limit reached", callback_data=cb)
 
 
 def final_failed_button(reason: Optional[str] = None) -> InlineKeyboardButton:
@@ -323,6 +345,22 @@ def failed_kb(provider: str, track_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [failed_status_button()],
+            [try_again_button(provider, track_id)],
+        ]
+    )
+
+
+def queue_full_kb(
+    provider: str,
+    track_id: str,
+    cap: Optional[int] = None,
+) -> InlineKeyboardMarkup:
+    """Per-user queue-cap kb: same two-row shape as `failed_kb` — a
+    failure label on top of a Try Again retry — but the label explains
+    the queue limit instead of a download failure."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [queue_full_status_button(cap)],
             [try_again_button(provider, track_id)],
         ]
     )

@@ -134,6 +134,7 @@ async def run(cfg: Any) -> None:
         bot_username=me.username or "",
         dm_probe=dm_probe,
         forward_log_channel_id=getattr(cfg, "FORWARD_LOG_CHANNEL_ID", "") or "",
+        max_user_queue=int(getattr(cfg, "MAX_USER_QUEUE", 10) or 10),
     )
     await job_runner.start()
 

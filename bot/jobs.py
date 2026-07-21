@@ -31,6 +31,8 @@ from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
     TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
 )
 from aiogram.types import (
     BufferedInputFile,
@@ -66,6 +68,7 @@ from .status import (
     inline_queue_kb,
     inline_stage_kb,
     permission_required_kb,
+    queue_full_kb,
     queue_kb,
     stage_kb,
 )
@@ -142,6 +145,23 @@ MAX_UPLOAD_ATTEMPTS = 3
 UPLOAD_RETRY_DELAY_S = 1.0
 UPLOAD_REQUEST_TIMEOUT_S = 180
 
+# Pacing for the cosmetic queue-position edits. Telegram throttles bots
+# per-chat (roughly one edit per second sustained), and the tracker fleet
+# used to fire one edit per queued job on every queue movement — a deep
+# queue meant hundreds of edits within seconds and a guaranteed
+# TelegramRetryAfter storm. Each placeholder message now updates at most
+# once per QUEUE_EDIT_MIN_INTERVAL_S, and edits within the same chat are
+# additionally serialized CHAT_EDIT_SPACING_S apart.
+QUEUE_EDIT_MIN_INTERVAL_S = 4.0
+CHAT_EDIT_SPACING_S = 1.5
+
+# Cached deliveries skip the download worker pool, so a pasted batch of
+# already-cached tracks would otherwise fire every send_audio at once and
+# exhaust the flood middleware's retry budget. This bounds how many cached
+# sends run concurrently — enough to feel instant, few enough that the
+# flood layer can absorb the rest.
+CACHED_SEND_CONCURRENCY = 4
+
 
 @dataclass
 class DeliveryTarget:
@@ -175,11 +195,17 @@ class JobRunner:
         bot_username: str,
         dm_probe: Optional[DMProbe] = None,
         forward_log_channel_id: Optional[str] = None,
+        max_user_queue: int = 10,
     ):
         self._bot = bot
         self._cache = cache
         self._registry = registry
         self._max_file_mb = max_file_mb
+        self._max_user_queue = max(1, int(max_user_queue))
+        # Fresh (non-cached) downloads currently queued or running, per
+        # user id. Bumped on submit, released when the job's future
+        # completes — delivered, failed, or cancelled alike.
+        self._user_inflight: dict[int, int] = {}
         self._bot_username = bot_username
         self._dm_probe = dm_probe
         self._forward_log_channel_id = self._normalize_channel_id(
@@ -200,6 +226,10 @@ class JobRunner:
         # event loop doesn't GC them mid-run. Each task discards itself
         # from this set on completion.
         self._queue_tasks: set[asyncio.Task] = set()
+        # Next allowed queue-position-edit time per chat / inline message
+        # (loop.time() based). See _reserve_edit_slot.
+        self._edit_slots: dict[object, float] = {}
+        self._cached_send_sem = asyncio.Semaphore(CACHED_SEND_CONCURRENCY)
 
     @staticmethod
     def _normalize_channel_id(channel_id: Optional[str]) -> Optional[str]:
@@ -242,12 +272,96 @@ class JobRunner:
         provider: Provider,
         track: Track,
         target: DeliveryTarget,
-    ) -> None:
-        """Submit a download job. When the queue is backed up deeper than
-        the worker pool (so the job can't start right away), also spawn a
-        background task that keeps the placeholder's status button showing
-        the job's live queue position until a worker picks it up."""
+    ) -> "asyncio.Task[str]":
+        """Route a request. Tracks with a cached file_id are delivered
+        immediately (a file_id send is a cheap Telegram API call, not a
+        download) — they never wait behind real downloads. Only cache
+        misses (and stale entries that need a re-download) enter the
+        download queue.
+
+        Returns the dispatch task; its result is the outcome — "cached" |
+        "queued" | "queue_full" | "dm_blocked" | "failed" — for callers
+        that want to phrase an accurate acknowledgement."""
+        task = asyncio.create_task(self._dispatch(queue, provider, track, target))
+        self._queue_tasks.add(task)
+        task.add_done_callback(self._queue_tasks.discard)
+        return task
+
+    async def _dispatch(
+        self,
+        queue: DownloadQueue,
+        provider: Provider,
+        track: Track,
+        target: DeliveryTarget,
+    ) -> str:
+        try:
+            return await self._dispatch_inner(queue, provider, track, target)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Reached only when the failure-marking calls themselves fail
+            # (usually the same outage that broke the delivery). Log now —
+            # nothing awaits this task, so an escaped exception would only
+            # surface as "Task exception was never retrieved" at GC time.
+            logger.exception(
+                "dispatch crashed [{}:{}]", track.provider, track.track_id
+            )
+            return "failed"
+
+    async def _dispatch_inner(
+        self,
+        queue: DownloadQueue,
+        provider: Provider,
+        track: Track,
+        target: DeliveryTarget,
+    ) -> str:
+        """Fast-path cached tracks; queue the rest. When the queue is
+        backed up deeper than the worker pool (so a queued job can't start
+        right away), also spawn a background task that keeps the
+        placeholder's status button showing the job's live queue position
+        until a worker picks it up."""
+        try:
+            # Peek before taking a semaphore slot: cached sends can hold
+            # a slot for minutes when flood-throttled, and a cache MISS
+            # must never queue behind them on its way to the download
+            # queue. Only actual hits enter the bounded section.
+            cached = await self._cache.get(track.provider, track.track_id)
+            if cached and cached.file_id:
+                async with self._cached_send_sem:
+                    if await self._try_cached_delivery(track, target):
+                        return "cached"
+        except DMNotOpenError as e:
+            logger.warning(
+                "[{}:{}] DM closed at delivery time: {}",
+                track.provider,
+                track.track_id,
+                e,
+            )
+            await self._mark_dm_blocked(target, track)
+            return "dm_blocked"
+        except Exception:
+            logger.exception(
+                "cached fast-path delivery failed [{}:{}]",
+                track.provider,
+                track.track_id,
+            )
+            await self._mark_failed(target, track)
+            return "failed"
+        uid = target.user_id
+        if uid is not None and self._user_inflight.get(uid, 0) >= self._max_user_queue:
+            logger.info(
+                "[{}:{}] user {} already has {} fresh downloads queued; rejecting",
+                track.provider,
+                track.track_id,
+                uid,
+                self._user_inflight[uid],
+            )
+            await self._mark_queue_full(target, track)
+            return "queue_full"
         fut = queue.submit(lambda: self.run(provider, track, target))
+        if uid is not None:
+            self._user_inflight[uid] = self._user_inflight.get(uid, 0) + 1
+            fut.add_done_callback(lambda _f, uid=uid: self._release_user_slot(uid))
         if queue.pending > queue.concurrency:
             task = asyncio.create_task(
                 self._track_queue_position(queue, fut, track, target)
@@ -255,6 +369,14 @@ class JobRunner:
             target.queue_task = task
             self._queue_tasks.add(task)
             task.add_done_callback(self._queue_tasks.discard)
+        return "queued"
+
+    def _release_user_slot(self, uid: int) -> None:
+        left = self._user_inflight.get(uid, 0) - 1
+        if left > 0:
+            self._user_inflight[uid] = left
+        else:
+            self._user_inflight.pop(uid, None)
 
     async def _track_queue_position(
         self,
@@ -273,6 +395,11 @@ class JobRunner:
         drains down to the worker count — reverting the button to the
         plain "Downloading..." label."""
         last_shown: Optional[tuple[int, int]] = None
+        last_edit = 0.0
+        loop = asyncio.get_running_loop()
+        slot_key: object = (
+            target.inline_message_id or target.chat_id or target.user_id
+        )
         try:
             while True:
                 # Snapshot the change-event before reading queue state, so
@@ -282,24 +409,57 @@ class JobRunner:
                 if pos < 0:
                     return  # picked up by a worker
                 total = queue.pending
-                if pos >= 1 and total > queue.concurrency:
-                    shown = (pos + 1, total)
-                    if shown != last_shown:
-                        await self._set_queue_kb(
-                            target,
-                            track,
-                            pos + 1,
-                            total,
-                        )
-                        last_shown = shown
-                else:
+                if pos == 0 or total <= queue.concurrency:
                     # At the front, or the queue is no deeper than the
                     # worker pool — hand the button back to the normal
-                    # "Downloading..." label and stop tracking.
+                    # "Downloading..." label and stop tracking. Also
+                    # slot-paced: a draining queue releases every tracker
+                    # at once, and un-gated reverts would be their own
+                    # edit burst. Skip the edit entirely if the job gets
+                    # picked up while waiting — the worker's own stage
+                    # edit takes over from there.
+                    slot = self._reserve_edit_slot(slot_key)
+                    if slot > 0 and await self._pause_tracker(queue, fut, slot):
+                        self._rollback_edit_slot(slot_key)
+                        return
+                    if queue.position(fut) < 0:
+                        self._rollback_edit_slot(slot_key)
+                        return
                     await self._set_stage_kb(target, track, "downloading")
                     return
-                # Wait until the queue actually changes — no fixed poll.
-                await changed.wait()
+                shown = (pos + 1, total)
+                if shown == last_shown:
+                    # Wait until the queue actually changes — no fixed poll.
+                    await changed.wait()
+                    continue
+                # Pace the edits (see QUEUE_EDIT_MIN_INTERVAL_S): first the
+                # per-message interval, then the per-chat slot. Both waits
+                # abort the instant the job is picked up (a parked tracker
+                # would otherwise pin the worker in _stop_queue_tracker)
+                # and re-read queue state afterwards so a stale position
+                # is never written.
+                wait = last_edit + QUEUE_EDIT_MIN_INTERVAL_S - loop.time()
+                if wait > 0:
+                    if await self._pause_tracker(queue, fut, wait):
+                        return
+                    continue
+                slot = self._reserve_edit_slot(slot_key)
+                if slot > 0:
+                    if await self._pause_tracker(queue, fut, slot):
+                        self._rollback_edit_slot(slot_key)
+                        return
+                    pos = queue.position(fut)
+                    if pos < 0:
+                        self._rollback_edit_slot(slot_key)
+                        return
+                    total = queue.pending
+                    if pos == 0 or total <= queue.concurrency:
+                        await self._set_stage_kb(target, track, "downloading")
+                        return
+                    shown = (pos + 1, total)
+                await self._set_queue_kb(target, track, shown[0], shown[1])
+                last_shown = shown
+                last_edit = loop.time()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -309,6 +469,52 @@ class JobRunner:
                 track.track_id,
                 e,
             )
+
+    async def _pause_tracker(
+        self, queue: DownloadQueue, fut: asyncio.Future, delay: float
+    ) -> bool:
+        """Wait out `delay` seconds of edit pacing, waking on every queue
+        change to check whether `fut` left the queue. Returns True the
+        moment the job is picked up (caller must stop tracking without
+        editing) — so a pacing wait never parks the tracker beyond its
+        job's pickup, and _stop_queue_tracker stays near-instant."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay
+        while True:
+            changed = queue.change_event
+            if queue.position(fut) < 0:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(changed.wait(), timeout=remaining)
+
+    def _reserve_edit_slot(self, key: object) -> float:
+        """Reserve the next allowed queue-position-edit time for `key` (a
+        chat id, or an inline_message_id) and return how long the caller
+        must sleep before using it. Consecutive reservations for the same
+        key land CHAT_EDIT_SPACING_S apart, so however deep the queue is,
+        one chat never sees more than ~1 edit per spacing interval."""
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if len(self._edit_slots) > 1024:
+            self._edit_slots = {
+                k: v for k, v in self._edit_slots.items() if v > now
+            }
+        slot = max(now, self._edit_slots.get(key, now))
+        self._edit_slots[key] = slot + CHAT_EDIT_SPACING_S
+        return slot - now
+
+    def _rollback_edit_slot(self, key: object) -> None:
+        """Give back a reservation that produced no edit (job picked up
+        mid-pause), so abandoned slots don't stack dead air in front of
+        the chat's still-pending edits."""
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cur = self._edit_slots.get(key)
+        if cur is not None:
+            self._edit_slots[key] = max(now, cur - CHAT_EDIT_SPACING_S)
 
     async def _stop_queue_tracker(self, target: DeliveryTarget) -> None:
         """Stop this job's queue-position tracker before the download
@@ -456,31 +662,10 @@ class JobRunner:
             target.user_id,
             target.request_query,
         )
-        cached = await self._cache.get(track.provider, track.track_id)
-        if cached and cached.file_id:
-            logger.info("[{}] cache hit -> file_id={}", tag, cached.file_id)
-            try:
-                await self._deliver_cached(track, cached, target)
-                return
-            except TelegramBadRequest as e:
-                # Any BadRequest whose message points at the file_id
-                # itself means the cached id can no longer be sent —
-                # could be a different bot uploaded it (file_ids are
-                # bot-scoped), a rotated id, or an expired reference.
-                # Evict the single stale entry and fall through to the
-                # normal download path so this user still gets the
-                # track AND the next request gets a fresh, valid id.
-                # We don't touch the rest of the cache.
-                if _is_stale_file_id_error(e):
-                    logger.warning(
-                        "[{}] cached file_id rejected by Telegram ({}); "
-                        "evicting this entry + re-downloading",
-                        tag, e,
-                    )
-                    await self._cache.remove(track.provider, track.track_id)
-                    # Fall through to the normal download path below.
-                else:
-                    raise
+        # Second-chance cache check: the cache may have been populated
+        # while this job waited in the queue (same track requested twice).
+        if await self._try_cached_delivery(track, target):
+            return
 
         # Upfront feasibility check: Telegram caps bot uploads at 50 MB.
         # If the track is so long that even compressing to the lowest
@@ -893,6 +1078,49 @@ class JobRunner:
         assert last_err is not None
         raise last_err
 
+    async def _try_cached_delivery(
+        self, track: Track, target: DeliveryTarget
+    ) -> bool:
+        """Attempt delivery straight from the file_id cache. Returns True
+        when the audio was delivered; False when there is no usable cache
+        entry — including a stale file_id that was just evicted — so the
+        caller must run a real download. Non-stale delivery errors
+        propagate to the caller's normal failure handling."""
+        cached = await self._cache.get(track.provider, track.track_id)
+        if not cached or not cached.file_id:
+            return False
+        tag = f"{track.provider}:{track.track_id}"
+        logger.info(
+            "<cyan>[job]</cyan> <magenta>{}</magenta> cache hit -> file_id={} "
+            "source={} user={} query={!r}",
+            tag,
+            cached.file_id,
+            target.request_source or "unknown",
+            target.user_id,
+            target.request_query,
+        )
+        try:
+            await self._deliver_cached(track, cached, target)
+            return True
+        except TelegramBadRequest as e:
+            # Any BadRequest whose message points at the file_id
+            # itself means the cached id can no longer be sent —
+            # could be a different bot uploaded it (file_ids are
+            # bot-scoped), a rotated id, or an expired reference.
+            # Evict the single stale entry and let the caller run the
+            # normal download path so this user still gets the
+            # track AND the next request gets a fresh, valid id.
+            # We don't touch the rest of the cache.
+            if _is_stale_file_id_error(e):
+                logger.warning(
+                    "[{}] cached file_id rejected by Telegram ({}); "
+                    "evicting this entry + re-downloading",
+                    tag, e,
+                )
+                await self._cache.remove(track.provider, track.track_id)
+                return False
+            raise
+
     async def _deliver_cached(
         self, track: Track, cached: CachedAudio, target: DeliveryTarget
     ) -> None:
@@ -1013,7 +1241,13 @@ class JobRunner:
         return sent
 
     async def _send_audio_with_retries(self, **kwargs):
-        """Retry transient Telegram network errors during upload."""
+        """Retry transient Telegram network errors during upload.
+
+        TelegramServerError (Bot API 5xx) is retried knowingly: a 5xx can
+        in principle land after Telegram accepted the send, so a retry may
+        duplicate the message. The alternative — surfacing a failure kb —
+        has the same duplicate risk (the user's manual retry) plus a
+        guaranteed missed delivery, so retrying is the better trade."""
         last_err: Optional[Exception] = None
         for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
             try:
@@ -1023,7 +1257,12 @@ class JobRunner:
                     request_timeout=UPLOAD_REQUEST_TIMEOUT_S,
                     **kwargs,
                 )
-            except (TelegramNetworkError, asyncio.TimeoutError) as e:
+            except (
+                TelegramNetworkError,
+                TelegramServerError,
+                ConnectionError,
+                asyncio.TimeoutError,
+            ) as e:
                 last_err = e
                 if attempt >= MAX_UPLOAD_ATTEMPTS:
                     break
@@ -1118,8 +1357,10 @@ class JobRunner:
                         message_id=target.status_message_id,
                         reply_markup=stage_kb(track, stage),
                     )
-        except TelegramBadRequest:
-            # Already edited / can't edit / removed. Best-effort.
+        except (TelegramBadRequest, TelegramRetryAfter):
+            # Already edited / can't edit / removed, or still throttled
+            # after the flood middleware's retries. Best-effort — a
+            # missed cosmetic edit must never kill the job or tracker.
             pass
 
     async def _set_queue_kb(
@@ -1138,7 +1379,7 @@ class JobRunner:
                         message_id=target.status_message_id,
                         reply_markup=queue_kb(track, position, total),
                     )
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramRetryAfter):
             pass
 
     async def _set_inline_kb(
@@ -1146,7 +1387,7 @@ class JobRunner:
     ) -> None:
         if not target.inline_message_id:
             return
-        with contextlib.suppress(TelegramBadRequest):
+        with contextlib.suppress(TelegramBadRequest, TelegramRetryAfter):
             await self._bot.edit_message_reply_markup(
                 inline_message_id=target.inline_message_id,
                 reply_markup=kb,
@@ -1290,6 +1531,55 @@ class JobRunner:
         except Exception as e:
             logger.error(
                 "_mark_failed send_message failed chat={} ({}): {}",
+                chat_id,
+                type(e).__name__,
+                e,
+            )
+
+    async def _mark_queue_full(self, target: DeliveryTarget, track: Track) -> None:
+        """Per-user queue cap hit: swap the placeholder kb for the
+        queue-limit label + Try Again. Same message shape as every other
+        failure — the caption text never changes, only the buttons.
+        Deliberately does NOT touch the inline retry counter: hitting the
+        cap is not a download failure, so it must not burn the user's
+        retry budget."""
+        kb = queue_full_kb(track.provider, track.track_id, self._max_user_queue)
+        if target.inline_message_id is not None:
+            await self._set_inline_kb(target, kb)
+            return
+        chat_id = target.chat_id or target.user_id
+        if chat_id is None:
+            return
+        if target.status_message_id is not None:
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=target.status_message_id,
+                    reply_markup=kb,
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    "_mark_queue_full edit_message_reply_markup failed chat={} mid={} ({}): {}",
+                    chat_id,
+                    target.status_message_id,
+                    type(e).__name__,
+                    e,
+                )
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=self.caption(
+                    track,
+                    original_spotify_url=target.original_spotify_url,
+                ),
+                reply_to_message_id=target.reply_to_message_id,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.error(
+                "_mark_queue_full send_message failed chat={} ({}): {}",
                 chat_id,
                 type(e).__name__,
                 e,

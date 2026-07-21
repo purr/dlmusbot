@@ -14,6 +14,7 @@ permission_info                    no-op alert (Permission Required)
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from typing import Optional
 
@@ -121,8 +122,23 @@ async def on_download(
         await cb.answer("Couldn't fetch that one. Try again?")
         return
 
-    job_runner.enqueue(queue, provider, track, target)
-    await cb.answer("Download started! The track will appear shortly.")
+    outcome_task = job_runner.enqueue(queue, provider, track, target)
+    # Wait briefly for the dispatch outcome so the toast matches reality
+    # (cached tracks deliver instantly; the per-user cap may reject).
+    # Shielded: a timeout must not cancel the dispatch itself. On timeout
+    # the request is still in flight — fall back to the generic text.
+    try:
+        outcome = await asyncio.wait_for(asyncio.shield(outcome_task), timeout=3.0)
+    except Exception:
+        outcome = None
+    await cb.answer(
+        {
+            "cached": "🎧 Sent! Check the track above.",
+            "queue_full": "Queue limit reached — wait for your downloads to finish.",
+            "dm_blocked": "Open the DM with the bot first.",
+            "failed": "Couldn't send that one. Try again?",
+        }.get(outcome, "Download started! The track will appear shortly.")
+    )
 
 
 def _target_for(cb: CallbackQuery) -> DeliveryTarget:
