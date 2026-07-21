@@ -58,6 +58,7 @@ from ..ui import (
     format_inline_empty_message,
     format_onboarding_card_description,
     format_track_caption,
+    n_of,
     visible_help_providers,
 )
 
@@ -751,13 +752,15 @@ async def on_inline_query(
     elif mode == "artist_empty":
         switch_pm_text = "🎤 Artist has no playable tracks"
     elif not results:
-        switch_pm_text = "No results"
+        switch_pm_text = "❌ No results"
     elif mode == "single":
         switch_pm_text = None
     elif mode == "artist":
-        switch_pm_text = f"🎤 {total} tracks by this artist"
+        switch_pm_text = f"🎤 {n_of(total, 'track')} by this artist"
+    elif mode == "playlist":
+        switch_pm_text = f"📚 {n_of(total, 'track')} in this collection"
     else:
-        switch_pm_text = f"Found {total} tracks"
+        switch_pm_text = f"🔍 Found {n_of(total, 'track')}"
 
     # Free-text search results are safe to cache — same query, same
     # results within a reasonable window. URL pastes (`single`, playlist,
