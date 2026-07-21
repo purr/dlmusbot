@@ -184,6 +184,26 @@ def _track_from_internal(st: _SpTrack) -> Track:
     )
 
 
+def _tracks_credited_to(
+    tracks: list[Track], artist_id: str, artist_name: str
+) -> list[Track]:
+    """Keep only tracks actually credited to the artist — main credit or
+    feature. A name search also ranks covers, tributes and soundalikes;
+    those never carry the artist's credit, so they drop out here. Match
+    by Spotify artist id when the credit has one (exact, immune to name
+    collisions), else by 1:1 case-insensitive name."""
+    want = artist_name.casefold().strip()
+    out: list[Track] = []
+    for t in tracks:
+        for a in t.artists:
+            if (a.artist_id and a.artist_id == artist_id) or (
+                (a.name or "").casefold().strip() == want
+            ):
+                out.append(t)
+                break
+    return out
+
+
 class SpotifyProvider(Provider):
     name = "spotify"
     label = "Spotify"
@@ -612,6 +632,7 @@ class SpotifyProvider(Provider):
                 "spotify artist search failed (%s); falling back to top tracks", e
             )
             tracks = []
+        tracks = _tracks_credited_to(tracks, entity_id, name)
         if not tracks and top_gids:
             tracks = await self._hydrate_top_gids(top_gids)
         return Playlist(
