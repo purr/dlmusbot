@@ -260,12 +260,17 @@ async def transcode_to_mp3(
     src_path: str | Path,
     *,
     bitrate_kbps: int = 320,
-    timeout: float = 90.0,
+    timeout: Optional[float] = None,
     delete_src: bool = True,
 ) -> Optional[Path]:
     """Transcode any ffmpeg-readable audio file to MP3 CBR. Returns the new
     path on success, None if ffmpeg is unavailable. Raises TranscodeError on
-    failure. Replaces the source file if `delete_src` is True."""
+    failure. Replaces the source file if `delete_src` is True.
+
+    `timeout=None` scales the ffmpeg deadline with the source duration:
+    a fixed 90s cap killed hour-long mixes mid-encode on a loaded host,
+    while re-encoding is normally many times faster than realtime — one
+    second of budget per second of audio is a generous but bounded ceiling."""
     if not ffmpeg_available():
         logger.warning("ffmpeg not on PATH — skipping mp3 transcode")
         return None
@@ -277,6 +282,13 @@ async def transcode_to_mp3(
     if dst == src:
         # Already mp3; nothing to do.
         return src
+
+    if timeout is None:
+        try:
+            duration = await asyncio.to_thread(_probe_duration_sync, src, 30.0)
+        except TranscodeError:
+            duration = 0.0
+        timeout = max(90.0, duration)
 
     t0 = time.perf_counter()
     src_size = src.stat().st_size
