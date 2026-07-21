@@ -230,6 +230,11 @@ class JobRunner:
         # (loop.time() based). See _reserve_edit_slot.
         self._edit_slots: dict[object, float] = {}
         self._cached_send_sem = asyncio.Semaphore(CACHED_SEND_CONCURRENCY)
+        # (provider, track_id) -> queue future of the fresh download that
+        # is currently queued or running for that exact track. Later
+        # requests for the same track piggyback on it (await + deliver
+        # from the cache entry it writes) instead of downloading twice.
+        self._inflight_jobs: dict[tuple[str, str], asyncio.Future] = {}
 
     @staticmethod
     def _normalize_channel_id(channel_id: Optional[str]) -> Optional[str]:
@@ -320,6 +325,7 @@ class JobRunner:
         right away), also spawn a background task that keeps the
         placeholder's status button showing the job's live queue position
         until a worker picks it up."""
+        job_key = (track.provider, track.track_id)
         try:
             # Peek before taking a semaphore slot: cached sends can hold
             # a slot for minutes when flood-throttled, and a cache MISS
@@ -330,6 +336,42 @@ class JobRunner:
                 async with self._cached_send_sem:
                     if await self._try_cached_delivery(track, target):
                         return "cached"
+            # Identical fresh download already queued or running? Wait
+            # for it and deliver from the cache entry it writes — never
+            # download the same track twice concurrently. The placeholder
+            # keeps its plain "Downloading..." button meanwhile. Shielded:
+            # cancelling this dispatch must not cancel the primary job.
+            # A loop, not a one-shot: when the primary fails, its waiters
+            # wake together — whichever runs first submits a fresh job
+            # (synchronously, below) and the rest must piggyback THAT
+            # instead of each submitting their own duplicate.
+            while True:
+                existing = self._inflight_jobs.get(job_key)
+                if existing is None or existing.done():
+                    break
+                logger.info(
+                    "[{}:{}] identical download in flight; piggybacking user={}",
+                    track.provider,
+                    track.track_id,
+                    target.user_id,
+                )
+                try:
+                    await asyncio.shield(existing)
+                except Exception:
+                    pass  # primary failed — re-check below
+                cached = await self._cache.get(track.provider, track.track_id)
+                if cached and cached.file_id:
+                    async with self._cached_send_sem:
+                        if await self._try_cached_delivery(track, target):
+                            return "cached"
+                # Primary failed, or delivered a cross-provider fallback
+                # cached under the fallback's key — loop to re-check for
+                # a sibling's fresh submit before downloading ourselves.
+                logger.info(
+                    "[{}:{}] piggybacked job left no cache entry; re-dispatching",
+                    track.provider,
+                    track.track_id,
+                )
         except DMNotOpenError as e:
             logger.warning(
                 "[{}:{}] DM closed at delivery time: {}",
@@ -358,7 +400,17 @@ class JobRunner:
             )
             await self._mark_queue_full(target, track)
             return "queue_full"
-        fut = queue.submit(lambda: self.run(provider, track, target))
+        fut = queue.submit(lambda: self.run(provider, track, target), key=uid)
+        self._inflight_jobs[job_key] = fut
+        # Unregister only our own entry — by completion time a newer
+        # submit for the same track may have replaced it.
+        fut.add_done_callback(
+            lambda _f, k=job_key: (
+                self._inflight_jobs.pop(k, None)
+                if self._inflight_jobs.get(k) is _f
+                else None
+            )
+        )
         if uid is not None:
             self._user_inflight[uid] = self._user_inflight.get(uid, 0) + 1
             fut.add_done_callback(lambda _f, uid=uid: self._release_user_slot(uid))
