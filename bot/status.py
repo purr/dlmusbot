@@ -14,6 +14,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.models import Track
 
+from .ui import n_of
+
 # Live download-pipeline stages, surfaced as the "status" button on the
 # placeholder. Providers cherry-pick which ones apply (SoundCloud only
 # needs "downloading" + "uploading"; Spotify also has "decrypting" and
@@ -97,8 +99,8 @@ def lookup_status_alert(stage_key: str) -> str:
         try:
             cap = int(stage_key.split(":", 1)[1])
             return (
-                f"You already have {cap} tracks in the download queue. "
-                "Wait for some to finish, then tap Try Again."
+                f"You already have {n_of(cap, 'track')} in the download "
+                "queue. Wait for some to finish, then tap Try Again."
             )
         except (ValueError, IndexError):
             pass

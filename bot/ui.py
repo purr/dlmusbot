@@ -13,6 +13,14 @@ def esc(text: str) -> str:
     return html.escape(text or "", quote=False)
 
 
+def n_of(count: int, noun: str, plural: Optional[str] = None) -> str:
+    """Count + correctly pluralized noun: "1 track" / "5 tracks".
+    Pass `plural` for irregular nouns; default appends "s"."""
+    if count == 1:
+        return f"1 {noun}"
+    return f"{count:,} {plural or noun + 's'}"
+
+
 def track_one_line(t: Track) -> str:
     return f"{t.artists_str} — {t.title} ({t.duration_str})"
 

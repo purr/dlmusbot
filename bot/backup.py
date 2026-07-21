@@ -44,6 +44,8 @@ from aiogram.types import BufferedInputFile
 from core import stats
 from core.atomic_io import atomic_write_bytes
 
+from .ui import n_of
+
 log = logging.getLogger(__name__)
 
 ARCHIVE_NAME = "dlmus_backup.tar.gz"
@@ -616,8 +618,8 @@ class BackupManager:
         msg = await self._bot.send_document(
             self._chat_id,
             BufferedInputFile(archive, filename=ARCHIVE_NAME),
-            caption=(f"dlmus backup\ncache {cache_count} entries\n"
-                     f"stats {stats_count} events"),
+            caption=(f"dlmus backup\ncache {n_of(cache_count, 'entry', 'entries')}\n"
+                     f"stats {n_of(stats_count, 'event')}"),
             disable_notification=True,
             request_timeout=180,
         )
