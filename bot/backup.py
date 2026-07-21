@@ -610,13 +610,16 @@ class BackupManager:
             log.warning("[backup] archive %.1f MB — approaching the 20 MB "
                         "download wall", gz / _MiB)
 
-        # 8. upload.
+        # 8. upload. Multi-MB archives on a busy uplink can exceed
+        # aiogram's default request timeout — the observed "tick failed"
+        # cause — so give the upload its own generous deadline.
         msg = await self._bot.send_document(
             self._chat_id,
             BufferedInputFile(archive, filename=ARCHIVE_NAME),
             caption=(f"dlmus backup\ncache {cache_count} entries\n"
                      f"stats {stats_count} events"),
             disable_notification=True,
+            request_timeout=180,
         )
 
         # 9. pin + verify (the commit point). Do NOT advance state on failure.

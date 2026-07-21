@@ -47,6 +47,7 @@ async def get_with_retry(
     max_attempts: int = 4,
     base_delay: float = 0.5,
     max_delay: float = 8.0,
+    timeout: Optional[aiohttp.ClientTimeout] = None,
 ) -> aiohttp.ClientResponse:
     """Retry GET on 408/425/429/5xx with exponential backoff.
 
@@ -59,8 +60,15 @@ async def get_with_retry(
     last_exc: Optional[BaseException] = None
     for attempt in range(1, max_attempts + 1):
         try:
-            r = await session.get(url, params=params, headers=headers)
-        except aiohttp.ClientError as e:
+            if timeout is not None:
+                r = await session.get(
+                    url, params=params, headers=headers, timeout=timeout,
+                )
+            else:
+                r = await session.get(url, params=params, headers=headers)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # ClientTimeout expiry raises asyncio.TimeoutError, not a
+            # ClientError — the most common transient, so it must retry.
             last_exc = e
             if attempt >= max_attempts:
                 raise

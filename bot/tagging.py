@@ -22,6 +22,7 @@ from mutagen.oggopus import OggOpus
 from PIL import Image
 
 from core.audio_convert import ffmpeg_available
+from core.http_retry import get_with_retry
 from core.logging_setup import logger
 from core.models import DownloadResult, Track
 
@@ -35,11 +36,21 @@ TG_THUMB_MAX_BYTES = 200 * 1024
 
 
 async def fetch_cover(http: aiohttp.ClientSession, url: str) -> Optional[bytes]:
-    """Fetch cover art bytes. Returns None on any failure."""
+    """Fetch cover art bytes. Returns None on any failure. Retries
+    transient network errors (CDN 5xx, server-side DNS blips) via
+    get_with_retry before giving up — a missing cover is cosmetic but
+    cheap to recover."""
     if not url:
         return None
+    # 2×10s keeps the worst case (~21s) inside the inline article→audio
+    # swap's tolerance; a third attempt pushed it near 50s.
     try:
-        async with http.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with await get_with_retry(
+            http,
+            url,
+            max_attempts=2,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
             if r.status != 200:
                 logger.error("cover fetch HTTP {} for {}", r.status, url)
                 return None
