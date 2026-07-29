@@ -121,6 +121,24 @@ async def on_download(
                 )
         await cb.answer("Couldn't fetch that one. Try again?")
         return
+    except Exception:
+        # get_track can raise plain exceptions the providers don't wrap
+        # (e.g. a malformed track_id from a stale/unresolved callback).
+        # Never let one bad callback take the whole bot down — and never
+        # re-embed the same track_id in another retry button, since
+        # whatever made it unparsable will make the retry fail identically.
+        logger.exception(
+            "callback track fetch crashed [{}:{}]", provider_name, track_id
+        )
+        if target.inline_message_id:
+            with contextlib.suppress(TelegramBadRequest):
+                await cb.bot.edit_message_reply_markup(
+                    inline_message_id=target.inline_message_id,
+                    reply_markup=final_failed_kb(),
+                )
+        with contextlib.suppress(TelegramBadRequest):
+            await cb.answer("Couldn't fetch that one.", show_alert=True)
+        return
 
     outcome_task = job_runner.enqueue(queue, provider, track, target)
     # Wait briefly for the dispatch outcome so the toast matches reality

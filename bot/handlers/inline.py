@@ -48,19 +48,18 @@ from core.fuzz import (
 )
 from core.logging_setup import logger
 from core.models import Track
-from core.shortlink import resolve as resolve_short_url
 from core.url_parser import parse as parse_url
+from core.url_parser import resolve_url_kind
 from providers.registry import Registry
 
 from ..jobs import JobRunner
 from ..status import downloading_button, example_inline_search_button
-from ..ui import (
+from ..onboarding import (
     format_inline_empty_message,
     format_onboarding_card_description,
-    format_track_caption,
-    n_of,
     visible_help_providers,
 )
+from ..ui import format_track_caption, n_of
 
 router = Router(name="inline")
 
@@ -349,20 +348,11 @@ async def _build_results(
         # search query — surface "Unsupported URL" so they know which
         # platforms are actually wired up.
         return [], "unsupported_url", 0, ""
-    if parsed and parsed.kind == "url" and parsed.provider in {"spotify", "soundcloud"}:
-        resolved = await resolve_short_url(parsed.entity_id)
-        reparsed = parse_url(resolved, registry)
-        if reparsed and reparsed.kind != "url":
-            parsed = reparsed
-        elif parsed.provider == "soundcloud":
-            parsed = parsed.__class__(
-                provider=parsed.provider,
-                kind=parsed.kind,
-                entity_id=resolved,
-                url=resolved,
-            )
-        else:
+    if parsed and parsed.kind == "url":
+        new_parsed = await resolve_url_kind(parsed, registry)
+        if new_parsed is None:
             return [], "unsupported_url", 0, ""
+        parsed = new_parsed
     if parsed:
         provider = registry.get(parsed.provider)
         if provider is not None:

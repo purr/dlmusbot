@@ -5,7 +5,7 @@ UX (mirrors purr/soundcloud-aiogram exactly):
        caption = format_track_caption + buttons [Source · Artist] [⏳ Downloading...]
     2. job runner downloads + tags + builds Telegram thumbnail.
     3. send_audio (replying to the user's link) with the SAME caption +
-       final buttons [Source · Artist] [❓ Wrong Artist/Title?].
+       final buttons [Source · Artist].
     4. delete the placeholder so the chat shows just the audio.
     5. file_id cached for next time.
 

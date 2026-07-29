@@ -5,7 +5,7 @@ Posts the FULL placeholder (purr-style):
     buttons= [Source · Artist] [⏳ Downloading...]
 
 Then the job runner sends the audio with the same caption + final buttons
-[Source · Artist] [❓ Wrong Artist/Title?] and deletes the placeholder.
+[Source · Artist] and deletes the placeholder.
 """
 
 from __future__ import annotations
@@ -21,13 +21,12 @@ from core.exceptions import (
 )
 from core.logging_setup import logger
 from core.models import Track
-from core.shortlink import resolve as resolve_short_url
-from core.url_parser import ParsedURL, parse_all
+from core.url_parser import ParsedURL, parse_all, resolve_url_kind
 from providers.registry import Registry
 
 from ..dm_probe import DMProbe
 from ..jobs import DeliveryTarget, JobRunner
-from ..status import failed_kb, final_failed_kb, placeholder_kb
+from ..status import failed_kb, failed_status_button, final_failed_kb, placeholder_kb
 from ..ui import PREPARING_TEXT, format_url_caption
 
 # Pretty labels for the album/playlist DM-rejection notice.
@@ -35,6 +34,16 @@ _KIND_LABEL = {
     "album": ("💿", "albums"),
     "playlist": ("📚", "playlists"),
 }
+
+
+def _failure_kb(parsed: ParsedURL) -> InlineKeyboardMarkup:
+    """Failure indicator, with a retry button only when `entity_id` is an
+    actual track id `get_track` can use. A `kind="url"` failure means
+    entity_id is still the raw pasted URL — wiring that into a retry
+    callback would crash the download on tap instead of just failing."""
+    if parsed.kind == "track":
+        return failed_kb(parsed.provider, parsed.entity_id)
+    return InlineKeyboardMarkup(inline_keyboard=[[failed_status_button()]])
 
 
 async def _reject_collection(
@@ -158,6 +167,16 @@ async def _enqueue_url(
     if provider is None:
         raise UnsupportedURLError(f"no provider for {parsed.provider}")
 
+    # Resolve shortlinks up front so every kind check below sees the real,
+    # final kind — one dispatch, not two copies that can drift apart.
+    if parsed.kind == "url":
+        new_parsed = await resolve_url_kind(parsed, registry)
+        if new_parsed is None:
+            raise UnsupportedURLError(
+                f"could not resolve {parsed.provider} shortlink: {parsed.entity_id}"
+            )
+        parsed = new_parsed
+
     # Albums / playlists are inline-only. DM downloads only allowed for
     # single tracks — pasting a 35-track album would otherwise queue a
     # mass download the user almost never wants. Bounce them to inline
@@ -188,23 +207,6 @@ async def _enqueue_url(
             request_query=parsed.url,
         )
         return
-
-    if parsed.kind == "url" and parsed.provider in {"spotify", "soundcloud"}:
-        resolved = await resolve_short_url(parsed.entity_id)
-        reparsed = parse_all(resolved, registry)
-        if reparsed and reparsed[0].kind != "url":
-            parsed = reparsed[0]
-        elif parsed.provider == "soundcloud":
-            parsed = parsed.__class__(
-                provider=parsed.provider,
-                kind=parsed.kind,
-                entity_id=resolved,
-                url=resolved,
-            )
-        else:
-            raise UnsupportedURLError(
-                f"could not resolve {parsed.provider} shortlink: {parsed.entity_id}"
-            )
 
     if parsed.kind == "url" and parsed.provider == "soundcloud":
         from providers.soundcloud.provider import (  # noqa: SLF001
@@ -299,7 +301,7 @@ async def on_dm_text(
                     format_url_caption(parsed.url, bot_username, parsed.provider),
                     reply_markup=final_failed_kb(e.reason)
                     if e.reason
-                    else failed_kb(parsed.provider, parsed.entity_id),
+                    else _failure_kb(parsed),
                     disable_web_page_preview=True,
                 )
             except Exception as re:
@@ -316,7 +318,7 @@ async def on_dm_text(
             try:
                 await message.reply(
                     format_url_caption(parsed.url, bot_username, parsed.provider),
-                    reply_markup=failed_kb(parsed.provider, parsed.entity_id),
+                    reply_markup=_failure_kb(parsed),
                     disable_web_page_preview=True,
                 )
             except Exception as re:
@@ -331,7 +333,7 @@ async def on_dm_text(
             try:
                 await message.reply(
                     format_url_caption(parsed.url, bot_username, parsed.provider),
-                    reply_markup=failed_kb(parsed.provider, parsed.entity_id),
+                    reply_markup=_failure_kb(parsed),
                     disable_web_page_preview=True,
                 )
             except Exception as re:

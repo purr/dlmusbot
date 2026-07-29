@@ -15,8 +15,15 @@ from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from .shortlink import resolve as _resolve_shortlink
+
 if TYPE_CHECKING:
     from providers.registry import Registry
+
+# Providers whose "url" kind means "needs an HTTP resolve before we know
+# what this is" (spoti.fi/spotify.link, on.soundcloud.com/snd.sc). Other
+# providers never produce kind="url" at all.
+_SHORTLINK_PROVIDERS = frozenset({"spotify", "soundcloud"})
 
 
 @dataclass(frozen=True)
@@ -88,3 +95,36 @@ def parse_all(text: str, registry: "Registry") -> list[ParsedURL]:
                 url=provider.canonical_url(m.kind, m.entity_id),
             ))
     return out
+
+
+async def resolve_url_kind(
+    parsed: ParsedURL, registry: "Registry"
+) -> Optional[ParsedURL]:
+    """Follow a shortlink through to what it actually points at.
+
+    Pass-through unchanged unless `parsed.kind == "url"` for a provider
+    that uses that kind for shortlinks (spoti.fi/spotify.link,
+    on.soundcloud.com/snd.sc) — the one thing every caller needs to do
+    with a `url`-kind match before it can dispatch on `.kind`, so it lives
+    here once instead of once per handler.
+
+    Returns None if the shortlink couldn't be resolved to anything a
+    provider recognizes; the caller decides how to surface that.
+    """
+    if parsed.kind != "url" or parsed.provider not in _SHORTLINK_PROVIDERS:
+        return parsed
+    resolved = await _resolve_shortlink(parsed.entity_id)
+    reparsed = parse(resolved, registry)
+    if reparsed is not None and reparsed.kind != "url":
+        return reparsed
+    if parsed.provider == "soundcloud":
+        # SoundCloud's own url-kind pattern is a plain permalink — this
+        # is already its terminal form, the provider's own
+        # `resolve_kind` figures out track/playlist/user from here.
+        return parsed.__class__(
+            provider=parsed.provider,
+            kind=parsed.kind,
+            entity_id=resolved,
+            url=resolved,
+        )
+    return None

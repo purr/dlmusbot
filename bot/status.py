@@ -129,10 +129,6 @@ SOURCE_LABELS = {
     "youtube_music": "📺 YouTube Music",
 }
 
-# id3_robot is a public Telegram bot purr links to for users to fix wrong
-# tagging. The `?start=dlmus` deep-link is the same trick.
-ID3_ROBOT_URL = "https://t.me/id3_robot?start=dlmus"
-
 
 def _safe_cb(*parts: str) -> str:
     cb = ":".join(parts)
@@ -212,13 +208,6 @@ def source_button(provider: str, url: str) -> InlineKeyboardButton:
     )
 
 
-def wrong_metadata_button() -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text="❓ Wrong Artist/Title? Click here!",
-        url=ID3_ROBOT_URL,
-    )
-
-
 def reencoded_warning_button(kbps: Optional[int] = None) -> InlineKeyboardButton:
     """Permanent indicator that the file was re-encoded at a lower
     bitrate to fit the upload cap. Encodes the actual target bitrate
@@ -247,9 +236,12 @@ def permission_required_button() -> InlineKeyboardButton:
     )
 
 
-def example_inline_search_button(seed: str = "drain gang") -> InlineKeyboardButton:
+def example_inline_search_button(
+    seed: str = "drain gang",
+    text: str = "🔍 Click here to start searching",
+) -> InlineKeyboardButton:
     return InlineKeyboardButton(
-        text="🔍 Click here to start searching",
+        text=text,
         switch_inline_query_current_chat=seed,
     )
 
@@ -308,17 +300,19 @@ def audio_kb(
     *,
     reencoded: bool = False,
     reencoded_kbps: Optional[int] = None,
-) -> InlineKeyboardMarkup:
+) -> Optional[InlineKeyboardMarkup]:
     """Final buttons under the delivered audio. Row 1: source + artist.
     Row 2 (only when re-encoded): the warning indicator with bitrate.
-    Row 3: the "❓ Wrong Artist/Title?" suggestion link."""
+    Returns None when a track has neither link, so the audio arrives
+    without an empty keyboard attached."""
     rows: list[list[InlineKeyboardButton]] = []
     r1 = _row_source_artist(track)
     if r1:
         rows.append(r1)
     if reencoded or reencoded_kbps:
         rows.append([reencoded_warning_button(reencoded_kbps)])
-    rows.append([wrong_metadata_button()])
+    if not rows:
+        return None
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
