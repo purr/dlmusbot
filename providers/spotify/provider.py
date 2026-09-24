@@ -204,41 +204,46 @@ def _tracks_credited_to(
     return out
 
 
+def _web_url_re(kind: str) -> re.Pattern[str]:
+    """Web-player URL matcher for one entity kind.
+
+    Spotify pads the path in front of the entity in several ways — locale
+    (`/intl-de/`, `/intl-pt-br/`), the legacy user-scoped playlist form
+    (`/user/<name>/playlist/<id>`) and `/embed/` — and `play.spotify.com`
+    still 301s to `open.`. Accepting leading segments keeps every one of
+    those shapes pointing at the same id instead of silently not matching;
+    the count is capped at 2 (the deepest real form) so a long crafted
+    message can't make the scan quadratic."""
+    return re.compile(
+        r"(?:open|play)\.spotify\.com/(?:[\w-]+/){0,2}?" + kind
+        + r"/([A-Za-z0-9]{22})"
+    )
+
+
 class SpotifyProvider(Provider):
     name = "spotify"
     label = "Spotify"
 
     URL_PATTERNS = [
-        (
-            "track",
-            re.compile(
-                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]{22})"
-            ),
-        ),
-        (
-            "album",
-            re.compile(
-                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]{22})"
-            ),
-        ),
-        (
-            "playlist",
-            re.compile(
-                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?playlist/([A-Za-z0-9]{22})"
-            ),
-        ),
-        (
-            "artist",
-            re.compile(
-                r"open\.spotify\.com/(?:intl-[a-z]{2}/)?artist/([A-Za-z0-9]{22})"
-            ),
-        ),
+        ("track", _web_url_re("track")),
+        ("album", _web_url_re("album")),
+        ("playlist", _web_url_re("playlist")),
+        ("artist", _web_url_re("artist")),
         ("track", re.compile(r"spotify:track:([A-Za-z0-9]{22})")),
         ("album", re.compile(r"spotify:album:([A-Za-z0-9]{22})")),
         ("playlist", re.compile(r"spotify:playlist:([A-Za-z0-9]{22})")),
         ("artist", re.compile(r"spotify:artist:([A-Za-z0-9]{22})")),
-        # Shortened / campaign URLs — need an HTTP redirect to resolve.
-        ("url", re.compile(r"(https?://(?:spoti\.fi|spotify\.link)/[^\s?#]+)")),
+        # Shortened / campaign URLs — need an HTTP resolve before we know
+        # what they point at. `open.spotify.com/s/<code>` is what the app's
+        # share sheet hands out now; it answers 200 with a JS redirect, so
+        # core.shortlink digs the target out of the page's og:url tag.
+        (
+            "url",
+            re.compile(
+                r"(https?://(?:spoti\.fi/|spotify\.link/|open\.spotify\.com/s/)"
+                r"[^\s?#]+)"
+            ),
+        ),
     ]
 
     def __init__(self, sp_dc: str):

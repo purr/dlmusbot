@@ -21,7 +21,7 @@ from core.exceptions import (
 )
 from core.logging_setup import logger
 from core.models import Track
-from core.url_parser import ParsedURL, parse_all, resolve_url_kind
+from core.url_parser import ParsedURL, looks_like_url, parse_all, resolve_url_kind
 from providers.registry import Registry
 
 from ..dm_probe import DMProbe
@@ -97,6 +97,16 @@ async def _reject_artist(message: Message, parsed: ParsedURL) -> None:
         ),
         disable_notification=True,
         disable_web_page_preview=True,
+    )
+
+
+def _unsupported_url_text(registry: Registry) -> str:
+    """Reply for a link no provider claims. Names the services actually
+    registered rather than a hardcoded list, so it can't drift."""
+    services = ", ".join(p.label for p in registry.all())
+    return (
+        "🤷 <b>I can't do anything with that link.</b>\n"
+        f"Send a track, album, playlist or artist link from {services}."
     )
 
 
@@ -267,6 +277,26 @@ async def on_dm_text(
     text = message.text or ""
     urls = parse_all(text, registry)
     if not urls:
+        # A link we don't claim (a podcast episode, a YouTube channel, some
+        # other service) used to be met with silence, which reads as a dead
+        # bot. Answer it — but only when the message is *just* a link, so
+        # chat that happens to contain one stays unanswered.
+        if looks_like_url(text):
+            logger.info(
+                "<cyan>[dm]</cyan> user={} unsupported url={!r}",
+                message.from_user.id,
+                text.strip()[:220],
+            )
+            try:
+                await message.reply(
+                    _unsupported_url_text(registry),
+                    disable_notification=True,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(
+                    "dm unsupported-url reply failed ({}): {}", type(e).__name__, e
+                )
         return
     logger.info(
         "<cyan>[dm]</cyan> user={} urls={} text={!r}",

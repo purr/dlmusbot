@@ -48,6 +48,7 @@ from core.fuzz import (
 )
 from core.logging_setup import logger
 from core.models import Track
+from core.url_parser import looks_like_url
 from core.url_parser import parse as parse_url
 from core.url_parser import resolve_url_kind
 from providers.registry import Registry
@@ -62,25 +63,6 @@ from ..onboarding import (
 from ..ui import format_track_caption, n_of
 
 router = Router(name="inline")
-
-
-# Catches *anything* that looks URL-shaped, including bare domains
-# ("foo.com/bar") and full schemes. Used to detect typed URLs that no
-# registered provider recognises so the inline UI can show "Unsupported
-# URL" instead of falling through to free-text search (which would
-# produce nonsensical results when the user clearly intended a link).
-_URL_LIKE_RE = re.compile(
-    r"""(
-        https?://\S+                        |  # explicit scheme
-        (?:[a-z0-9-]+\.)+[a-z]{2,}/\S+       |  # bare host + path
-        spotify:[a-z]+:[A-Za-z0-9]+             # spotify URI
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def _looks_like_url(text: str) -> bool:
-    return bool(_URL_LIKE_RE.fullmatch(text.strip()))
 
 
 # Power-user shortcut: `<provider>:<track_id>` skips search entirely and
@@ -343,7 +325,7 @@ async def _build_results(
         return ([t] if t else []), "single", (1 if t else 0), ""
 
     parsed = parse_url(query, registry)
-    if parsed is None and _looks_like_url(query):
+    if parsed is None and looks_like_url(query):
         # User typed a URL that no provider claims. Don't pretend it's a
         # search query — surface "Unsupported URL" so they know which
         # platforms are actually wired up.

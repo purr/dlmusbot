@@ -5,12 +5,16 @@ Two public entry points:
 - `parse(text, registry)` — return the first ParsedURL found in `text`.
 - `parse_all(text, registry)` — return every distinct match.
 
+Plus `looks_like_url(text)`, which tells "a link no provider claims" apart
+from "not a link", so handlers can answer the first and ignore the second.
+
 Plus a tracking-param scrubber used to render clean canonical links back to
 the user (strips si=, utm_*, fbclid=, igshid=, ref=, ...).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional, TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -24,6 +28,26 @@ if TYPE_CHECKING:
 # what this is" (spoti.fi/spotify.link, on.soundcloud.com/snd.sc). Other
 # providers never produce kind="url" at all.
 _SHORTLINK_PROVIDERS = frozenset({"spotify", "soundcloud"})
+
+
+# Catches *anything* URL-shaped, including bare domains ("foo.com/bar") and
+# full schemes. Both entry points that take user text (inline query, DM
+# message) use it to tell "no provider claims this link" apart from "this
+# isn't a link at all" — a link we can't handle gets an answer, plain text
+# gets ignored.
+_URL_LIKE_RE = re.compile(
+    r"""(
+        https?://\S+                        |  # explicit scheme
+        (?:[a-z0-9-]+\.)+[a-z]{2,}/\S+       |  # bare host + path
+        spotify:[a-z]+:[A-Za-z0-9]+             # spotify URI
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def looks_like_url(text: str) -> bool:
+    """True when `text` is nothing but a URL."""
+    return bool(_URL_LIKE_RE.fullmatch((text or "").strip()))
 
 
 @dataclass(frozen=True)
@@ -114,6 +138,8 @@ async def resolve_url_kind(
     if parsed.kind != "url" or parsed.provider not in _SHORTLINK_PROVIDERS:
         return parsed
     resolved = await _resolve_shortlink(parsed.entity_id)
+    if resolved is None:
+        return None
     reparsed = parse(resolved, registry)
     if reparsed is not None and reparsed.kind != "url":
         return reparsed
