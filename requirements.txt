@@ -21,3 +21,6 @@ colorama
 #   pefile, unicorn, rich, markdown_it, mdurl, pygments, idna, multidict,
 #   yarl, frozenlist, aiosignal, aiohappyeyeballs, propcache, attrs,
 #   annotated_types, pydantic_core, typing_extensions, typing_inspection
+# headless chromium, used only to mint a YouTube PO token when the
+# "not a bot" gate fires (see providers/youtube_music/browser_session.py)
+playwright>=1.55

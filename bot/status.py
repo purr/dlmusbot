@@ -68,6 +68,19 @@ STATUS_ALERTS: dict[str, str] = {
     "final_failed:unavailable": (
         "This track isn't playable in your region or has been removed."
     ),
+    "final_failed:age_gated": (
+        "This YouTube video is age-restricted — YouTube only serves it to "
+        "signed-in adults, and we couldn't find a free copy elsewhere."
+    ),
+    "final_failed:bot_check": (
+        "YouTube is blocking downloads from this server right now, and we "
+        "couldn't find this song elsewhere. Try a Spotify or SoundCloud "
+        "link instead."
+    ),
+    "final_failed:rate_limited": (
+        "YouTube is rate-limiting this server — that usually clears within "
+        "an hour. Try again later, or send a Spotify or SoundCloud link."
+    ),
     "final_failed:drm": (
         "This SoundCloud track is DRM-protected (encrypted streams) and "
         "we couldn't find a free copy on Spotify or YouTube Music either. "

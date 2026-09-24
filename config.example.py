@@ -59,9 +59,22 @@ SP_DC: str = ""
 
 # Optional cookie file path for age-gated content or your private uploads.
 # Recommended location: "data/cookies.youtube.txt"
+# Must be in Netscape format (first line "# Netscape HTTP Cookie File") -
+# it is load-tested at startup, and an unreadable one is logged as an error
+# and ignored rather than breaking every YouTube request.
 # Empty = no cookies (works for ~all public Music tracks via the Android
 # Music client trick). Cobalt.tools and Invidious use the same approach.
 YT_COOKIES_FILE: str = ""
+
+# When YouTube answers "Sign in to confirm you're not a bot", mint a
+# proof-of-origin token in a headless chromium and retry that download
+# once. Only fires on that specific gate, never on a normal download.
+# The browser installs itself in the background the first time it's
+# needed (~115 MB, plus apt libraries on a root linux host) - nothing to
+# install by hand. The token is bound to the video AND to this machine's
+# IP, so it has to be minted here; it can't be generated elsewhere and
+# copied over. False = never launch a browser.
+YT_BROWSER_POTOKEN: bool = True
 
 
 # --- Download / queue ------------------------------------------------------

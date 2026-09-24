@@ -94,6 +94,7 @@ def build_default_registry(cfg) -> Registry:
         from .youtube_music.provider import YouTubeMusicProvider
         reg.register(YouTubeMusicProvider(
             cookies_file=getattr(cfg, "YT_COOKIES_FILE", None) or None,
+            browser_potoken=bool(getattr(cfg, "YT_BROWSER_POTOKEN", True)),
         ))
     except Exception:
         log.exception("failed to load YouTube Music provider")

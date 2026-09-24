@@ -23,11 +23,16 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-# Permanent ProviderError reasons that should trigger fallback rather
-# than a hard failure. DRM (CommonEncryption HLS), Go+ (snippet only)
-# and unavailable (region-lock / removed) all mean "this provider can't
-# deliver, but the song might exist elsewhere as a free upload."
-FALLBACK_REASONS: frozenset[str] = frozenset({"drm", "goplus", "unavailable"})
+# ProviderError reasons that should trigger fallback rather than a hard
+# failure. DRM (CommonEncryption HLS), Go+ (snippet only) and unavailable
+# (region-lock / removed) all mean "this provider can't deliver, but the
+# song might exist elsewhere as a free upload." The YouTube walls
+# (age-gate, bot check, rate limit) mean the same thing in practice: no
+# amount of retrying gets us that file right now, and the track is often
+# on Spotify anyway.
+FALLBACK_REASONS: frozenset[str] = frozenset({
+    "drm", "goplus", "unavailable", "age_gated", "bot_check", "rate_limited",
+})
 
 # Fuzzy-match floor on "<artist> <title>". 75 tolerates "feat." /
 # remaster / punctuation differences without letting unrelated tracks
