@@ -59,6 +59,7 @@ from core.queue import DownloadQueue
 from providers.base import Provider
 from providers.registry import Registry
 
+from .chat_action import ChatActionHandle, ChatActionHub
 from .dm_probe import DMProbe
 from .status import (
     audio_kb,
@@ -230,6 +231,10 @@ class JobRunner:
         # (loop.time() based). See _reserve_edit_slot.
         self._edit_slots: dict[object, float] = {}
         self._cached_send_sem = asyncio.Semaphore(CACHED_SEND_CONCURRENCY)
+        # Chat-header activity indicator ("sending audio…"), refreshed on
+        # a timer for as long as a job is running. One loop per chat,
+        # shared by every job in it — see bot/chat_action.py.
+        self._actions = ChatActionHub(bot)
         # (provider, track_id) -> queue future of the fresh download that
         # is currently queued or running for that exact track. Later
         # requests for the same track piggyback on it (await + deliver
@@ -256,6 +261,7 @@ class JobRunner:
             task.cancel()
         if self._queue_tasks:
             await asyncio.gather(*self._queue_tasks, return_exceptions=True)
+        await self._actions.close()
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -263,6 +269,15 @@ class JobRunner:
     @property
     def bot_username(self) -> str:
         return self._bot_username
+
+    def chat_action(
+        self, chat_id: Optional[int], stage: str = "resolving"
+    ) -> ChatActionHandle:
+        """Claim the chat's activity indicator from outside the job
+        pipeline — e.g. a handler resolving a URL before any placeholder
+        exists. Returns an async-context-manager handle; inert when
+        `chat_id` is None."""
+        return self._actions.acquire(chat_id, stage)
 
     def caption(self, track: Track, original_spotify_url: Optional[str] = None) -> str:
         return format_track_caption(
@@ -602,8 +617,17 @@ class JobRunner:
         tried_track_ids = (
             _tried_track_ids if _tried_track_ids is not None else {track.track_id}
         )
+        # Keep the chat header alive ("sending file…" → "sending audio…")
+        # for the whole job, failure handling included. Acquired here
+        # rather than inside `_do_run` so a cross-provider fallback (which
+        # re-enters `run`) never leaves the indicator dark between two
+        # attempts — the handles are refcounted per chat, so the nested
+        # acquire costs no extra API calls.
+        action = self._actions.acquire(
+            target.chat_id or target.user_id, "downloading"
+        )
         try:
-            await self._do_run(provider, track, target)
+            await self._do_run(provider, track, target, action)
         except DMNotOpenError as e:
             logger.warning(
                 "[{}:{}] DM closed at delivery time: {}",
@@ -696,11 +720,17 @@ class JobRunner:
                 "unhandled job failure [{}:{}]", track.provider, track.track_id
             )
             await self._mark_failed(target, track)
+        finally:
+            await action.release()
 
     # ------------------------------------------------------------------
 
     async def _do_run(
-        self, provider: Provider, track: Track, target: DeliveryTarget
+        self,
+        provider: Provider,
+        track: Track,
+        target: DeliveryTarget,
+        action: ChatActionHandle,
     ) -> None:
         # A worker is now running this job — kill the queue-position
         # tracker (if any) and wait for it to stop before any stage edit,
@@ -758,6 +788,11 @@ class JobRunner:
         last_stage = {"v": ""}
 
         async def set_stage(stage: str) -> None:
+            # The chat-header action is updated first and unconditionally:
+            # it's a local, idempotent assignment (the refresh loop picks
+            # it up), and it must still be right when a provider re-emits
+            # the stage the button already shows.
+            action.set_stage(stage)
             if stage == last_stage["v"]:
                 return
             last_stage["v"] = stage
@@ -1250,26 +1285,32 @@ class JobRunner:
 
         cap = self.caption(result.track, original_spotify_url=original_spotify_url)
 
-        try:
-            sent = await self._send_audio_with_retries(
-                chat_id=chat_id,
-                audio=audio_ref,
-                caption=cap,
-                performer=result.track.artists_str,
-                title=result.track.title,
-                duration=result.track.duration_seconds or None,
-                thumbnail=thumb_ref,
-                reply_to_message_id=target.reply_to_message_id,
-                reply_markup=audio_kb(
-                    result.track,
-                    reencoded=reencoded or bool(reencoded_kbps),
-                    reencoded_kbps=reencoded_kbps or None,
-                ),
-            )
-        except TelegramForbiddenError as e:
-            raise DMNotOpenError(
-                f"can't deliver to chat {chat_id} — user has not opened a DM"
-            ) from e
+        # "Sending audio…" in the chat header for the upload itself. The
+        # download pipeline already moved its own handle to "uploading";
+        # the cached fast path has no handle at all, so acquiring one here
+        # is what covers cache hits. Refcounted per chat — when both are
+        # live they share the single refresh loop.
+        async with self._actions.acquire(chat_id, "uploading"):
+            try:
+                sent = await self._send_audio_with_retries(
+                    chat_id=chat_id,
+                    audio=audio_ref,
+                    caption=cap,
+                    performer=result.track.artists_str,
+                    title=result.track.title,
+                    duration=result.track.duration_seconds or None,
+                    thumbnail=thumb_ref,
+                    reply_to_message_id=target.reply_to_message_id,
+                    reply_markup=audio_kb(
+                        result.track,
+                        reencoded=reencoded or bool(reencoded_kbps),
+                        reencoded_kbps=reencoded_kbps or None,
+                    ),
+                )
+            except TelegramForbiddenError as e:
+                raise DMNotOpenError(
+                    f"can't deliver to chat {chat_id} — user has not opened a DM"
+                ) from e
 
         # Drop the placeholder. Telegram allows a bot to delete its own
         # messages within 48h; in DMs this always works.

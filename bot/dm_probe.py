@@ -1,8 +1,13 @@
 """Detect whether the bot can DM a given user.
 
 Telegram doesn't expose this directly. The reliable probe is to call
-`sendChatAction` for the user — it succeeds with a transient typing
+`sendChatAction` for the user — it succeeds with a transient status
 indicator if the user has started the bot, returns 403/400 otherwise.
+
+The probe is only ever fired right before an audio delivery is queued,
+so it uses the same action the pipeline will keep refreshing
+(`chat_action.DELIVERY_ACTION`) instead of "typing": the flash the user
+sees is then the first frame of "sending file…", not a lie about typing.
 
 Result is cached in-memory (positives only) since DM permission rarely
 flips back to "no" once granted.
@@ -19,6 +24,8 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramAPIError,
 )
+
+from .chat_action import DELIVERY_ACTION
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +54,7 @@ class DMProbe:
         if user_id in self._known_open:
             return True
         try:
-            await bot.send_chat_action(chat_id=user_id, action="typing")
+            await bot.send_chat_action(chat_id=user_id, action=DELIVERY_ACTION)
         except TelegramForbiddenError:
             return False
         except TelegramBadRequest as e:
